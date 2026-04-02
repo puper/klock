@@ -98,21 +98,25 @@ type LockEvent struct {
 
 // Config 定义客户端行为参数。
 type Config struct {
-	// SessionLease, when set, is used directly for server-side lease.
-	// When zero, server lease is computed as LocalTTL + ServerLeaseBuffer.
+	// SessionLease 是“客户端请求的会话租约时长”（单位：time.Duration）。
+	// 1. >0：按该值向服务端申请 lease。
+	// 2. =0：客户端按 LocalTTL + ServerLeaseBuffer 推导请求值。
+	// 3. 最终生效值由服务端决定，可能被服务端默认值/上限策略约束。
 	SessionLease time.Duration
-	// HeartbeatInterval controls heartbeat period.
+	// HeartbeatInterval 控制心跳发送周期。
 	HeartbeatInterval time.Duration
-	// HeartbeatTimeout controls per-heartbeat request timeout.
+	// HeartbeatTimeout 控制单次 heartbeat RPC 的超时时间。
 	HeartbeatTimeout time.Duration
-	// ServerLeaseBuffer is fixed safety buffer added to local TTL when SessionLease is not set.
+	// ServerLeaseBuffer 是在未显式设置 SessionLease 时，
+	// 推导服务端 lease 请求值所附加的安全缓冲（LocalTTL + ServerLeaseBuffer）。
 	ServerLeaseBuffer time.Duration
-	// LocalTTL is client-side lock validity window.
-	// If zero, defaults to 2 * HeartbeatInterval.
+	// LocalTTL 是客户端本地锁句柄有效期的默认值。
+	// 1. LockOption.LocalTTL <= 0 时，使用该默认值。
+	// 2. =0 时，默认取 2 * HeartbeatInterval。
 	LocalTTL time.Duration
-	// LocalSweepInterval controls local TTL expiration scan frequency.
+	// LocalSweepInterval 控制本地 TTL 过期扫描频率。
 	LocalSweepInterval time.Duration
-	// AuthToken is sent as Bearer token via gRPC metadata header "authorization".
+	// AuthToken 会通过 gRPC metadata 的 "authorization" 头以 Bearer 方式发送。
 	AuthToken string
 }
 
