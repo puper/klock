@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -29,6 +30,11 @@ const (
 	headerServerID       = "X-Lock-Server-ID"
 	headerProtocol       = "X-Lock-Protocol-Version"
 	errorCodeSessionGone = "SESSION_GONE"
+
+	maxJSONBodyBytes      = 1 << 20
+	maxIdempotencyEntries = 4096
+	expiredRetention      = 10 * time.Minute
+	maxExpiredSessions    = 10000
 )
 
 type createSessionRequest struct {
@@ -84,15 +90,23 @@ type lockHandle struct {
 	once   sync.Once
 }
 
+type expiredInfo struct {
+	reason string
+	at     time.Time
+}
+
 type sessionState struct {
 	id string
 
 	lease     time.Duration
 	expiresAt time.Time
 	timer     *time.Timer
+	timerSeq  uint64
 
 	acquireByRequest map[string]lockResponse
-	releaseByRequest map[string]struct{}
+	acquireOrder     []string
+	releaseByRequest map[string]string
+	releaseOrder     []string
 	locksByToken     map[string]*lockHandle
 }
 
@@ -108,7 +122,9 @@ type lockService struct {
 	nextFence       uint64
 	sessions        map[string]*sessionState
 	tokens          map[string]*lockHandle
-	expiredSessions map[string]string
+	expiredSessions map[string]expiredInfo
+
+	maxIdempotencyEntries int
 }
 
 func newLockService(locker *hierlock.HierarchicalLocker, defaultLease, maxLease time.Duration, serverID string) *lockService {
@@ -119,7 +135,8 @@ func newLockService(locker *hierlock.HierarchicalLocker, defaultLease, maxLease 
 		serverID:        serverID,
 		sessions:        make(map[string]*sessionState),
 		tokens:          make(map[string]*lockHandle),
-		expiredSessions: make(map[string]string),
+		expiredSessions: make(map[string]expiredInfo),
+		maxIdempotencyEntries: maxIdempotencyEntries,
 	}
 }
 
@@ -142,13 +159,18 @@ func (s *lockService) createSession(req createSessionRequest) (sessionResponse, 
 		lease:            lease,
 		expiresAt:        now.Add(lease),
 		acquireByRequest: make(map[string]lockResponse),
-		releaseByRequest: make(map[string]struct{}),
+		acquireOrder:     make([]string, 0, 64),
+		releaseByRequest: make(map[string]string),
+		releaseOrder:     make([]string, 0, 64),
 		locksByToken:     make(map[string]*lockHandle),
 	}
-	st.timer = time.AfterFunc(lease, func() { s.expireSession(sessionID, "lease_expired") })
 
 	s.mu.Lock()
 	s.sessions[sessionID] = st
+	// Install timer only after session is visible in map to avoid missing expiry
+	// when very short leases fire before registration.
+	s.armSessionTimerLocked(st)
+	s.pruneExpiredLocked(now)
 	s.mu.Unlock()
 
 	return sessionResponse{
@@ -164,7 +186,7 @@ func (s *lockService) heartbeat(sessionID string) (sessionResponse, error) {
 	s.mu.Lock()
 	st, ok := s.sessions[sessionID]
 	if !ok {
-		reason := s.expiredSessions[sessionID]
+		reason := s.expiredReasonLocked(sessionID)
 		s.mu.Unlock()
 		if reason != "" {
 			return sessionResponse{}, &apiError{status: http.StatusGone, code: errorCodeSessionGone, msg: "session expired: " + reason}
@@ -172,7 +194,7 @@ func (s *lockService) heartbeat(sessionID string) (sessionResponse, error) {
 		return sessionResponse{}, &apiError{status: http.StatusNotFound, code: "SESSION_NOT_FOUND", msg: "session not found"}
 	}
 	st.expiresAt = time.Now().Add(st.lease)
-	st.timer.Reset(st.lease)
+	s.armSessionTimerLocked(st)
 	resp := sessionResponse{
 		SessionID:       st.id,
 		LeaseMS:         st.lease.Milliseconds(),
@@ -202,7 +224,7 @@ func (s *lockService) acquire(ctx context.Context, req lockRequest) (lockRespons
 	s.mu.Lock()
 	st, ok := s.sessions[req.SessionID]
 	if !ok {
-		reason := s.expiredSessions[req.SessionID]
+		reason := s.expiredReasonLocked(req.SessionID)
 		s.mu.Unlock()
 		if reason != "" {
 			return lockResponse{}, &apiError{status: http.StatusGone, code: errorCodeSessionGone, msg: "session expired: " + reason}
@@ -246,10 +268,7 @@ func (s *lockService) acquire(ctx context.Context, req lockRequest) (lockRespons
 		return lockResponse{}, err
 	}
 
-	h := &lockHandle{
-		token:  s.nextLockToken(),
-		unlock: unlockFn,
-	}
+	h := &lockHandle{token: s.nextLockToken(), unlock: unlockFn}
 	resp := lockResponse{
 		Token:           h.token,
 		Fence:           atomic.AddUint64(&s.nextFence, 1),
@@ -264,7 +283,7 @@ func (s *lockService) acquire(ctx context.Context, req lockRequest) (lockRespons
 	s.mu.Lock()
 	st, ok = s.sessions[req.SessionID]
 	if !ok {
-		reason := s.expiredSessions[req.SessionID]
+		reason := s.expiredReasonLocked(req.SessionID)
 		s.mu.Unlock()
 		h.safeUnlock()
 		if reason != "" {
@@ -277,7 +296,7 @@ func (s *lockService) acquire(ctx context.Context, req lockRequest) (lockRespons
 		h.safeUnlock()
 		return cached, nil
 	}
-	st.acquireByRequest[req.RequestID] = resp
+	s.putAcquireIdempotentLocked(st, req.RequestID, resp)
 	st.locksByToken[h.token] = h
 	s.tokens[h.token] = h
 	s.mu.Unlock()
@@ -296,16 +315,19 @@ func (s *lockService) release(sessionID, token, requestID string) (bool, error) 
 	s.mu.Lock()
 	st, ok := s.sessions[sessionID]
 	if !ok {
-		reason := s.expiredSessions[sessionID]
+		reason := s.expiredReasonLocked(sessionID)
 		s.mu.Unlock()
 		if reason != "" {
 			return false, &apiError{status: http.StatusGone, code: errorCodeSessionGone, msg: "session expired: " + reason}
 		}
 		return false, &apiError{status: http.StatusNotFound, code: "SESSION_NOT_FOUND", msg: "session not found"}
 	}
-	if _, ok := st.releaseByRequest[requestID]; ok {
+	if prevToken, ok := st.releaseByRequest[requestID]; ok {
 		s.mu.Unlock()
-		return true, nil
+		if prevToken == token {
+			return true, nil
+		}
+		return false, &apiError{status: http.StatusConflict, code: "IDEMPOTENCY_CONFLICT", msg: "request_id already used for a different token"}
 	}
 	h, ok := st.locksByToken[token]
 	if !ok {
@@ -314,7 +336,7 @@ func (s *lockService) release(sessionID, token, requestID string) (bool, error) 
 	}
 	delete(st.locksByToken, token)
 	delete(s.tokens, token)
-	st.releaseByRequest[requestID] = struct{}{}
+	s.putReleaseIdempotentLocked(st, requestID, token)
 	s.mu.Unlock()
 
 	h.safeUnlock()
@@ -331,7 +353,8 @@ func (s *lockService) expireSession(sessionID, reason string) bool {
 		return false
 	}
 	delete(s.sessions, sessionID)
-	s.expiredSessions[sessionID] = reason
+	s.expiredSessions[sessionID] = expiredInfo{reason: reason, at: time.Now()}
+	s.pruneExpiredLocked(time.Now())
 	if st.timer != nil {
 		st.timer.Stop()
 	}
@@ -347,10 +370,123 @@ func (s *lockService) expireSession(sessionID, reason string) bool {
 	return true
 }
 
+func (s *lockService) expiredReasonLocked(sessionID string) string {
+	info, ok := s.expiredSessions[sessionID]
+	if !ok {
+		return ""
+	}
+	if time.Since(info.at) > expiredRetention {
+		delete(s.expiredSessions, sessionID)
+		return ""
+	}
+	return info.reason
+}
+
+func (s *lockService) pruneExpiredLocked(now time.Time) {
+	for id, info := range s.expiredSessions {
+		if now.Sub(info.at) > expiredRetention {
+			delete(s.expiredSessions, id)
+		}
+	}
+	for len(s.expiredSessions) > maxExpiredSessions {
+		for id := range s.expiredSessions {
+			delete(s.expiredSessions, id)
+			break
+		}
+	}
+}
+
 func (h *lockHandle) safeUnlock() {
-	h.once.Do(func() {
-		h.unlock()
+	h.once.Do(func() { h.unlock() })
+}
+
+func (s *lockService) armSessionTimerLocked(st *sessionState) {
+	st.timerSeq++
+	seq := st.timerSeq
+	sessionID := st.id
+	d := time.Until(st.expiresAt)
+	if d < 0 {
+		d = 0
+	}
+	if st.timer != nil {
+		st.timer.Stop()
+	}
+	st.timer = time.AfterFunc(d, func() {
+		s.onSessionTimer(sessionID, seq)
 	})
+}
+
+func (s *lockService) onSessionTimer(sessionID string, seq uint64) {
+	s.mu.Lock()
+	st, ok := s.sessions[sessionID]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	if st.timerSeq != seq {
+		s.mu.Unlock()
+		return
+	}
+	// If expiresAt moved forward due to heartbeat, re-arm and do not expire now.
+	if time.Now().Before(st.expiresAt) {
+		s.armSessionTimerLocked(st)
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+	s.expireSession(sessionID, "lease_expired")
+}
+
+func (s *lockService) putAcquireIdempotentLocked(st *sessionState, requestID string, resp lockResponse) {
+	if _, exists := st.acquireByRequest[requestID]; exists {
+		return
+	}
+	maxEntries := s.maxIdempotencyEntries
+	if maxEntries <= 0 {
+		maxEntries = maxIdempotencyEntries
+	}
+	if len(st.acquireByRequest) >= maxEntries {
+		s.evictOldestAcquireLocked(st)
+	}
+	st.acquireByRequest[requestID] = resp
+	st.acquireOrder = append(st.acquireOrder, requestID)
+}
+
+func (s *lockService) putReleaseIdempotentLocked(st *sessionState, requestID, token string) {
+	if _, exists := st.releaseByRequest[requestID]; exists {
+		return
+	}
+	maxEntries := s.maxIdempotencyEntries
+	if maxEntries <= 0 {
+		maxEntries = maxIdempotencyEntries
+	}
+	if len(st.releaseByRequest) >= maxEntries {
+		s.evictOldestReleaseLocked(st)
+	}
+	st.releaseByRequest[requestID] = token
+	st.releaseOrder = append(st.releaseOrder, requestID)
+}
+
+func (s *lockService) evictOldestAcquireLocked(st *sessionState) {
+	for len(st.acquireOrder) > 0 {
+		oldest := st.acquireOrder[0]
+		st.acquireOrder = st.acquireOrder[1:]
+		if _, ok := st.acquireByRequest[oldest]; ok {
+			delete(st.acquireByRequest, oldest)
+			return
+		}
+	}
+}
+
+func (s *lockService) evictOldestReleaseLocked(st *sessionState) {
+	for len(st.releaseOrder) > 0 {
+		oldest := st.releaseOrder[0]
+		st.releaseOrder = st.releaseOrder[1:]
+		if _, ok := st.releaseByRequest[oldest]; ok {
+			delete(st.releaseByRequest, oldest)
+			return
+		}
+	}
 }
 
 func (s *lockService) nextSessionID() string {
@@ -381,7 +517,10 @@ func newHandler(svc *lockService) http.Handler {
 		case http.MethodPost:
 			var req createSessionRequest
 			if r.Body != nil {
-				_ = json.NewDecoder(r.Body).Decode(&req)
+				if err := json.NewDecoder(io.LimitReader(r.Body, maxJSONBodyBytes)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+					writeError(w, svc, http.StatusBadRequest, "BAD_REQUEST", "invalid JSON body")
+					return
+				}
 			}
 			resp, err := svc.createSession(req)
 			if err != nil {
@@ -452,7 +591,7 @@ func newHandler(svc *lockService) http.Handler {
 		}
 
 		var req lockRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.NewDecoder(io.LimitReader(r.Body, maxJSONBodyBytes)).Decode(&req); err != nil {
 			writeError(w, svc, http.StatusBadRequest, "BAD_REQUEST", "invalid JSON body")
 			return
 		}
@@ -568,6 +707,10 @@ func main() {
 		Addr:              addr,
 		Handler:           newHandler(svc),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	log.Printf("lock server listening on %s server_id=%s protocol=%s", addr, serverID, protocolVersion)

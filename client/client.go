@@ -32,6 +32,7 @@ const (
 	defaultServerLeaseBuffer  = 3 * time.Second
 	defaultLocalTTLMultiplier = 2
 	defaultSweepInterval      = 200 * time.Millisecond
+	sessionInitPollInterval   = 10 * time.Millisecond
 )
 
 type LockOption struct {
@@ -84,12 +85,14 @@ type Client struct {
 	http    *http.Client
 	cfg     Config
 
-	mu            sync.Mutex
-	sessionID     string
-	serverID      string
-	heartbeatStop context.CancelFunc
-	nextReq       uint64
-	handles       map[string]*LockHandle
+	mu                  sync.Mutex
+	sessionID           string
+	serverID            string
+	heartbeatStop       context.CancelFunc
+	sweepStop           context.CancelFunc
+	sessionInitInFlight bool
+	nextReq             uint64
+	handles             map[string]*LockHandle
 }
 
 type LockHandle struct {
@@ -223,7 +226,8 @@ func NewWithConfig(baseURL string, httpClient *http.Client, cfg Config) *Client 
 		handles: make(map[string]*LockHandle),
 	}
 
-	sweepCtx, _ := context.WithCancel(context.Background())
+	sweepCtx, sweepCancel := context.WithCancel(context.Background())
+	c.sweepStop = sweepCancel
 	go c.localExpiryLoop(sweepCtx)
 	return c
 }
@@ -342,65 +346,79 @@ func (c *Client) unlockHandle(ctx context.Context, h *LockHandle) error {
 func (c *Client) Close(ctx context.Context) error {
 	c.mu.Lock()
 	sessionID := c.sessionID
-	stop := c.heartbeatStop
+	hbStop := c.heartbeatStop
+	sweepStop := c.sweepStop
 	c.sessionID = ""
 	c.heartbeatStop = nil
+	c.sweepStop = nil
+	affected := c.collectHandlesLocked(sessionID)
 	c.mu.Unlock()
 
-	if stop != nil {
-		stop()
+	for _, h := range affected {
+		h.fail(LockEvent{
+			Type:       EventSessionGone,
+			Message:    "client closed",
+			SessionID:  sessionID,
+			Token:      h.Token,
+			ErrorCode:  "CLIENT_CLOSE",
+			OccurredAt: time.Now(),
+		})
+	}
+
+	if hbStop != nil {
+		hbStop()
+	}
+	if sweepStop != nil {
+		sweepStop()
 	}
 	if sessionID == "" {
 		return nil
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/v1/sessions/"+sessionID, nil)
-	if err != nil {
-		return err
-	}
-	c.decorateRequest(req)
 
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	c.observeServer(resp.Header.Get(headerServerID))
-
-	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
-		return nil
-	}
-	err = decodeHTTPError(resp)
-	c.handleAPIError(sessionID, err)
-	return err
+	return c.closeSessionRemote(ctx, sessionID)
 }
 
 func (c *Client) ensureSession(ctx context.Context) (string, error) {
-	c.mu.Lock()
-	if c.sessionID != "" {
-		id := c.sessionID
+	for {
+		c.mu.Lock()
+		if c.sessionID != "" {
+			id := c.sessionID
+			c.mu.Unlock()
+			return id, nil
+		}
+		if !c.sessionInitInFlight {
+			c.sessionInitInFlight = true
+			c.mu.Unlock()
+
+			resp, err := c.createSession(ctx)
+
+			c.mu.Lock()
+			c.sessionInitInFlight = false
+			if err != nil {
+				c.mu.Unlock()
+				return "", err
+			}
+			if c.sessionID == "" {
+				c.sessionID = resp.SessionID
+				if resp.ServerID != "" {
+					c.serverID = resp.ServerID
+				}
+				hbCtx, cancel := context.WithCancel(context.Background())
+				c.heartbeatStop = cancel
+				go c.heartbeatLoop(hbCtx, resp.SessionID)
+			}
+			id := c.sessionID
+			c.mu.Unlock()
+			return id, nil
+		}
 		c.mu.Unlock()
-		return id, nil
-	}
-	c.mu.Unlock()
 
-	resp, err := c.createSession(ctx)
-	if err != nil {
-		return "", err
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(sessionInitPollInterval):
+		}
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.sessionID != "" {
-		return c.sessionID, nil
-	}
-	c.sessionID = resp.SessionID
-	if resp.ServerID != "" {
-		c.serverID = resp.ServerID
-	}
-	hbCtx, cancel := context.WithCancel(context.Background())
-	c.heartbeatStop = cancel
-	go c.heartbeatLoop(hbCtx, resp.SessionID)
-	return c.sessionID, nil
 }
 
 func (c *Client) invalidateSession(sessionID string) {
@@ -513,8 +531,30 @@ func (c *Client) failSessionOnHeartbeat(sessionID string, cause error) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = c.Close(ctx)
+		_ = c.closeSessionRemote(ctx, sessionID)
 	}()
+}
+
+func (c *Client) closeSessionRemote(ctx context.Context, sessionID string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/v1/sessions/"+sessionID, nil)
+	if err != nil {
+		return err
+	}
+	c.decorateRequest(req)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	c.observeServer(resp.Header.Get(headerServerID))
+
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		return nil
+	}
+	err = decodeHTTPError(resp)
+	c.handleAPIError(sessionID, err)
+	return err
 }
 
 func (c *Client) createSession(ctx context.Context) (sessionResponse, error) {

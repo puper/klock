@@ -281,3 +281,104 @@ func TestAutoRenewLocalTTLOnHeartbeatSuccess(t *testing.T) {
 		t.Fatalf("unlock failed: %v", err)
 	}
 }
+
+func TestHeartbeatFailureDoesNotStopLocalExpiryLoopAfterSessionReinit(t *testing.T) {
+	var (
+		mu             sync.Mutex
+		sessionCreates int
+	)
+
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(headerServerID, "srv-a")
+		w.Header().Set(headerProtocol, protocolVersion)
+
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/sessions":
+			mu.Lock()
+			sessionCreates++
+			n := sessionCreates
+			mu.Unlock()
+			sessionID := "sess-1"
+			if n >= 2 {
+				sessionID = "sess-2"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"session_id":       sessionID,
+				"lease_ms":         3000,
+				"expires_at":       time.Now().Add(3 * time.Second).UTC().Format(time.RFC3339Nano),
+				"server_id":        "srv-a",
+				"protocol_version": protocolVersion,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/sessions/sess-1/heartbeat":
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":            "temporary heartbeat failure",
+				"code":             "TEMP_HEARTBEAT_ERROR",
+				"server_id":        "srv-a",
+				"protocol_version": protocolVersion,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/sessions/sess-2/heartbeat":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"session_id":       "sess-2",
+				"server_id":        "srv-a",
+				"protocol_version": protocolVersion,
+			})
+		case r.Method == http.MethodDelete && (r.URL.Path == "/v1/sessions/sess-1" || r.URL.Path == "/v1/sessions/sess-2"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/locks":
+			var req map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			sid, _ := req["session_id"].(string)
+			token := "lk-1"
+			if sid == "sess-2" {
+				token = "lk-2"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"token":            token,
+				"fence":            1,
+				"session_id":       sid,
+				"server_id":        "srv-a",
+				"protocol_version": protocolVersion,
+			})
+		case r.Method == http.MethodDelete && (r.URL.Path == "/v1/locks/lk-1" || r.URL.Path == "/v1/locks/lk-2"):
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer s.Close()
+
+	c := NewWithConfig(s.URL, s.Client(), Config{
+		SessionLease:       300 * time.Millisecond,
+		HeartbeatInterval:  25 * time.Millisecond,
+		LocalSweepInterval: 10 * time.Millisecond,
+	})
+
+	h1, err := c.Lock(context.Background(), "tenant-1", "res-1", LockOption{LocalTTL: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("first lock failed: %v", err)
+	}
+
+	select {
+	case ev := <-h1.Done():
+		if ev.Type != EventSessionGone {
+			t.Fatalf("expected session gone after heartbeat failures, got %s", ev.Type)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected first handle to fail-closed after heartbeat failures")
+	}
+
+	h2, err := c.Lock(context.Background(), "tenant-1", "res-2", LockOption{LocalTTL: 60 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("second lock failed: %v", err)
+	}
+
+	select {
+	case ev := <-h2.Done():
+		if ev.Type != EventLocalExpired {
+			t.Fatalf("expected local TTL expiry on second handle, got %s", ev.Type)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected second handle to expire locally")
+	}
+}
