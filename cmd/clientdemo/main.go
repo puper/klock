@@ -48,7 +48,10 @@ func newClient(addr, token string) (*client.Client, error) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	h, err := c.Lock(ctx, "demo-health", "ping", client.LockOption{Timeout: 500 * time.Millisecond})
+	h, err := c.Lock(ctx, "demo-health", "ping", client.LockOption{
+		Timeout:        800 * time.Millisecond,
+		AttemptTimeout: 300 * time.Millisecond,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -75,13 +78,17 @@ func must(err error) {
 
 func runBasicLockUnlock(c *client.Client) error {
 	log.Printf("[S1] basic lock/unlock start")
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	h, err := c.Lock(ctx, "tenant-demo", "res-basic", client.LockOption{Timeout: time.Second})
+	h, err := c.Lock(ctx, "tenant-demo", "res-basic", client.LockOption{
+		Timeout:        3 * time.Second,
+		AttemptTimeout: 800 * time.Millisecond,
+	})
 	if err != nil {
 		return fmt.Errorf("S1 lock failed: %w", err)
 	}
 	log.Printf("[S1] lock acquired token=%s fence=%d", h.Token, h.Fence)
+	time.Sleep(time.Second * 5)
 	if err := h.Unlock(context.Background()); err != nil {
 		return fmt.Errorf("S1 unlock failed: %w", err)
 	}
@@ -92,7 +99,10 @@ func runBasicLockUnlock(c *client.Client) error {
 
 func runContentionTimeout(c *client.Client) error {
 	log.Printf("[S2] contention timeout start")
-	h1, err := c.Lock(context.Background(), "tenant-demo", "res-hot", client.LockOption{Timeout: 1500 * time.Millisecond})
+	h1, err := c.Lock(context.Background(), "tenant-demo", "res-hot", client.LockOption{
+		Timeout:        1500 * time.Millisecond,
+		AttemptTimeout: 500 * time.Millisecond,
+	})
 	if err != nil {
 		return fmt.Errorf("S2 first lock failed: %w", err)
 	}
@@ -100,7 +110,10 @@ func runContentionTimeout(c *client.Client) error {
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 600*time.Millisecond)
 	defer cancel2()
-	_, err = c.Lock(ctx2, "tenant-demo", "res-hot", client.LockOption{Timeout: 500 * time.Millisecond})
+	_, err = c.Lock(ctx2, "tenant-demo", "res-hot", client.LockOption{
+		Timeout:        500 * time.Millisecond,
+		AttemptTimeout: 200 * time.Millisecond,
+	})
 	if err == nil {
 		_ = h1.Unlock(context.Background())
 		return fmt.Errorf("S2 expected timeout under contention, got success")
@@ -116,7 +129,10 @@ func runContentionTimeout(c *client.Client) error {
 
 func runRetryAfterRelease(c *client.Client) error {
 	log.Printf("[S3] retry after release start")
-	h, err := c.Lock(context.Background(), "tenant-demo", "res-retry", client.LockOption{Timeout: 1200 * time.Millisecond})
+	h, err := c.Lock(context.Background(), "tenant-demo", "res-retry", client.LockOption{
+		Timeout:        1200 * time.Millisecond,
+		AttemptTimeout: 500 * time.Millisecond,
+	})
 	if err != nil {
 		return fmt.Errorf("S3 first lock failed: %w", err)
 	}
@@ -127,7 +143,10 @@ func runRetryAfterRelease(c *client.Client) error {
 	}
 	<-h.Done()
 
-	h2, err := c.Lock(context.Background(), "tenant-demo", "res-retry", client.LockOption{Timeout: 1200 * time.Millisecond})
+	h2, err := c.Lock(context.Background(), "tenant-demo", "res-retry", client.LockOption{
+		Timeout:        1200 * time.Millisecond,
+		AttemptTimeout: 500 * time.Millisecond,
+	})
 	if err != nil {
 		return fmt.Errorf("S3 reacquire failed: %w", err)
 	}
@@ -140,8 +159,9 @@ func runRetryAfterRelease(c *client.Client) error {
 func runLocalTTLExpiry(c *client.Client) error {
 	log.Printf("[S4] local ttl expiry start")
 	h, err := c.Lock(context.Background(), "tenant-demo", "res-ttl", client.LockOption{
-		Timeout:  1200 * time.Millisecond,
-		LocalTTL: 300 * time.Millisecond,
+		Timeout:        1200 * time.Millisecond,
+		AttemptTimeout: 500 * time.Millisecond,
+		LocalTTL:       300 * time.Millisecond,
 	})
 	if err != nil {
 		return fmt.Errorf("S4 lock failed: %w", err)
@@ -177,7 +197,10 @@ func runAuthFailureScenario(addr, token string) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
-	_, err := bad.Lock(ctx, "tenant-demo", "res-auth", client.LockOption{Timeout: 1200 * time.Millisecond})
+	_, err := bad.Lock(ctx, "tenant-demo", "res-auth", client.LockOption{
+		Timeout:        1200 * time.Millisecond,
+		AttemptTimeout: 500 * time.Millisecond,
+	})
 	if err == nil {
 		return fmt.Errorf("S5 expected auth failure, got success")
 	}

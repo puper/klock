@@ -26,6 +26,9 @@ type fakeLockRPCServer struct {
 	releaseRequestID []string
 	failAcquireP2    string
 	failAcquireCode  codes.Code
+	acquireTimeoutMS []int64
+	acquireDeadlines []time.Duration
+	acquireDelay     time.Duration
 }
 
 func (f *fakeLockRPCServer) requireAuth(ctx context.Context) error {
@@ -80,7 +83,19 @@ func (f *fakeLockRPCServer) Acquire(ctx context.Context, req *lockrpcpb.LockRequ
 	f.mu.Lock()
 	failP2 := f.failAcquireP2
 	failCode := f.failAcquireCode
+	f.acquireTimeoutMS = append(f.acquireTimeoutMS, req.TimeoutMs)
+	if dl, ok := ctx.Deadline(); ok {
+		f.acquireDeadlines = append(f.acquireDeadlines, time.Until(dl))
+	}
+	delay := f.acquireDelay
 	f.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
 	if failP2 != "" && req.P2 == failP2 {
 		return nil, status.Error(failCode, "simulated acquire failure")
 	}
@@ -91,6 +106,64 @@ func (f *fakeLockRPCServer) Acquire(ctx context.Context, req *lockrpcpb.LockRequ
 		ServerId:        "srv-a",
 		ProtocolVersion: protocolVersion,
 	}, nil
+}
+
+func TestLockAttemptTimeoutAppliedPerAcquire(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer lis.Close()
+
+	grpcSrv := grpc.NewServer()
+	fake := &fakeLockRPCServer{authToken: "test-token"}
+	lockrpcpb.RegisterLockServiceServer(grpcSrv, fake)
+	go grpcSrv.Serve(lis)
+	defer grpcSrv.Stop()
+
+	c := NewWithConfig("grpc://"+lis.Addr().String(), Config{
+		SessionLease:      2 * time.Second,
+		HeartbeatInterval: 200 * time.Millisecond,
+		HeartbeatTimeout:  500 * time.Millisecond,
+		LocalTTL:          2 * time.Second,
+		AuthToken:         "test-token",
+	})
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = c.Close(closeCtx)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	h, err := c.Lock(ctx, "tenant-1", "res-attempt", LockOption{
+		Timeout:        time.Second,
+		AttemptTimeout: 120 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("lock failed: %v", err)
+	}
+	if err := h.Unlock(context.Background()); err != nil {
+		t.Fatalf("unlock failed: %v", err)
+	}
+	<-h.Done()
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.acquireTimeoutMS) == 0 {
+		t.Fatal("expected acquire timeout_ms recorded")
+	}
+	gotTimeout := fake.acquireTimeoutMS[0]
+	if gotTimeout <= 0 || gotTimeout > 120 {
+		t.Fatalf("expected acquire timeout_ms in (0,120], got %d", gotTimeout)
+	}
+	if len(fake.acquireDeadlines) == 0 {
+		t.Fatal("expected acquire context deadline captured")
+	}
+	gotDeadline := fake.acquireDeadlines[0]
+	if gotDeadline <= 0 || gotDeadline > 220*time.Millisecond {
+		t.Fatalf("expected per-attempt deadline <=220ms, got %s", gotDeadline)
+	}
 }
 
 func (f *fakeLockRPCServer) Release(ctx context.Context, req *lockrpcpb.ReleaseRequest) (*lockrpcpb.ReleaseResponse, error) {

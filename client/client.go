@@ -48,6 +48,13 @@ type LockOption struct {
 	// 2. >0：在该总时长内自动重试；超时后返回 context deadline exceeded。
 	// 3. 不影响已拿到锁后的持有时长。
 	Timeout time.Duration
+	// AttemptTimeout 控制“单次 acquire RPC 尝试”的超时时长。
+	//
+	// 语义：
+	// 1. =0：单次尝试不额外限时，仅受 Timeout/ctx 约束。
+	// 2. >0：每次重试都会使用该上限；若剩余总时长更短，则自动截断到剩余时长。
+	// 3. 建议与 Timeout 搭配使用，形成“总时长 + 单次尝试”双层超时。
+	AttemptTimeout time.Duration
 	// LocalTTL 控制“本地句柄有效期”。
 	//
 	// 语义：
@@ -367,11 +374,28 @@ func (c *Client) lockWithScope(ctx context.Context, scope Scope, p1, p2 string, 
 		}
 		lastSessionID = sessionID
 
+		attemptCtx := waitCtx
+		attemptCancel := func() {}
+		if opt.AttemptTimeout > 0 {
+			attemptDur := opt.AttemptTimeout
+			if dl, ok := waitCtx.Deadline(); ok {
+				remain := time.Until(dl)
+				if remain <= 0 {
+					return nil, waitCtx.Err()
+				}
+				if attemptDur > remain {
+					attemptDur = remain
+				}
+			}
+			attemptCtx, attemptCancel = context.WithTimeout(waitCtx, attemptDur)
+		}
+
 		attemptTimeout := int64(0)
-		if dl, ok := waitCtx.Deadline(); ok {
+		if dl, ok := attemptCtx.Deadline(); ok {
 			remain := time.Until(dl)
 			if remain <= 0 {
-				return nil, waitCtx.Err()
+				attemptCancel()
+				return nil, attemptCtx.Err()
 			}
 			attemptTimeout = durationMS(remain)
 			if attemptTimeout <= 0 {
@@ -379,7 +403,7 @@ func (c *Client) lockWithScope(ctx context.Context, scope Scope, p1, p2 string, 
 			}
 		}
 
-		resp, err := c.acquire(waitCtx, lockRequest{
+		resp, err := c.acquire(attemptCtx, lockRequest{
 			Scope:     scope,
 			P1:        p1,
 			P2:        p2,
@@ -387,6 +411,7 @@ func (c *Client) lockWithScope(ctx context.Context, scope Scope, p1, p2 string, 
 			SessionID: sessionID,
 			RequestID: acquireReqID,
 		})
+		attemptCancel()
 		if err == nil {
 			c.observeServer(resp.ServerID)
 			h := c.newHandle(resp, opt)

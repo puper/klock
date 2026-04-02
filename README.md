@@ -92,7 +92,8 @@ func main() {
 	defer cancel()
 
 	h, err := c.Lock(lockCtx, "tenant-1", "res-1", client.LockOption{
-		Timeout: 1200 * time.Millisecond, // 整次加锁调用的总等待时间（含内部重试）；0 表示一直重试直到 ctx 结束
+		Timeout:        1200 * time.Millisecond, // 整次加锁调用的总等待时间（含内部重试）；0 表示一直重试直到 ctx 结束
+		AttemptTimeout: 300 * time.Millisecond,  // 单次 acquire RPC 超时（每次重试上限）
 	})
 	if err != nil {
 		panic(err)
@@ -122,6 +123,7 @@ func main() {
 3. `Done() <-chan LockEvent`：锁关闭/失效通知
 4. `Unlock(ctx)`：主动释放
 5. `UnlockWithRetry(ctx, maxAttempts, retryDelay)`：解锁失败自动重试（复用同一 request_id）
+6. `LockOption.Timeout`：整次加锁总时长；`LockOption.AttemptTimeout`：单次 acquire 尝试时长
 
 `Done()` 可能收到的事件：
 
