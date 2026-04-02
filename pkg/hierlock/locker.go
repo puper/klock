@@ -3,7 +3,6 @@ package hierlock
 import (
 	"context"
 	"errors"
-	"hash/fnv"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -250,8 +249,10 @@ func spinUntilLockedWithGate(ctx context.Context, canTry func() bool, tryLock fu
 	}
 
 	backoff := time.Microsecond
+	gateBlocked := false
 	for attempts := 0; ; attempts++ {
 		if canTry != nil && !canTry() {
+			gateBlocked = true
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -269,6 +270,11 @@ func spinUntilLockedWithGate(ctx context.Context, canTry func() bool, tryLock fu
 				}
 			}
 			continue
+		}
+		if gateBlocked {
+			attempts = 0
+			backoff = time.Microsecond
+			gateBlocked = false
 		}
 
 		if tryLock() {
@@ -310,9 +316,12 @@ func sleepOrDone(ctx context.Context, d time.Duration) bool {
 
 // hashString 使用 FNV-1a 计算字符串哈希，用于分片定位。
 func hashString(s string) uint32 {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(s))
-	return h.Sum32()
+	h := uint32(2166136261)
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	return h
 }
 
 // stats returns the current shard-local node counts (for testing).

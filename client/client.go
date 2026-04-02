@@ -33,11 +33,15 @@ const (
 )
 
 const (
-	defaultHeartbeatTimeout   = 2 * time.Second
-	defaultServerLeaseBuffer  = 3 * time.Second
-	defaultLocalTTLMultiplier = 2
-	defaultSweepInterval      = 200 * time.Millisecond
-	defaultAcquireRetryDelay  = 100 * time.Millisecond
+	defaultHeartbeatTimeout        = 2 * time.Second
+	defaultServerLeaseBuffer       = 3 * time.Second
+	defaultLocalTTLMultiplier      = 2
+	defaultSweepInterval           = 200 * time.Millisecond
+	defaultAcquireRetryDelay       = 100 * time.Millisecond
+	defaultWatchReconnectInitial   = 100 * time.Millisecond
+	defaultWatchReconnectMax       = 1600 * time.Millisecond
+	defaultWatchReconnectFailAfter = 5 * time.Second
+	defaultWatchStableResetAfter   = 500 * time.Millisecond
 )
 
 type LockOption struct {
@@ -132,11 +136,13 @@ type Client struct {
 	sweepStop           context.CancelFunc
 	sessionInitInFlight bool
 	sessionInitDone     chan struct{}
+	sessionInitWG       sync.WaitGroup
 	bgActive            int
 	bgDone              chan struct{}
 	closed              bool
 	nextReq             uint64
 	handles             map[string]*LockHandle
+	remoteCloseInFlight map[string]chan struct{}
 	initErr             error
 }
 
@@ -299,10 +305,11 @@ func NewWithConfig(baseURL string, cfg Config) *Client {
 
 	target := strings.TrimSpace(strings.TrimPrefix(baseURL, "grpc://"))
 	c := &Client{
-		baseURL: target,
-		cfg:     cfg,
-		handles: make(map[string]*LockHandle),
-		bgDone:  make(chan struct{}),
+		baseURL:             target,
+		cfg:                 cfg,
+		handles:             make(map[string]*LockHandle),
+		bgDone:              make(chan struct{}),
+		remoteCloseInFlight: make(map[string]chan struct{}),
 	}
 
 	conn, err := grpc.NewClient(
@@ -454,11 +461,7 @@ func (c *Client) failClosedOnUncertainLockFailure(sessionID string, cause error)
 		ErrorCode:  "LOCK_UNCERTAIN_RESULT",
 		OccurredAt: time.Now(),
 	})
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = c.closeSessionRemote(ctx, sessionID)
-	}()
+	c.closeSessionRemoteBestEffort(sessionID)
 }
 
 // isRetriableAcquireError 判断是否应继续重试加锁。
@@ -658,9 +661,15 @@ func (c *Client) Close(ctx context.Context) error {
 		}
 		return err
 	}
+	if err := waitWaitGroupWithContext(ctx, &c.sessionInitWG); err != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return err
+	}
 	var closeErr error
 	if sessionID != "" {
-		closeErr = c.closeSessionRemote(ctx, sessionID)
+		closeErr = c.closeSessionRemoteManaged(ctx, sessionID)
 	}
 	if conn != nil {
 		_ = conn.Close()
@@ -686,23 +695,27 @@ func (c *Client) ensureSession(ctx context.Context) (string, error) {
 			c.sessionInitInFlight = true
 			done := make(chan struct{})
 			c.sessionInitDone = done
+			c.sessionInitWG.Add(1)
 			c.mu.Unlock()
 
 			resp, err := c.createSession(ctx)
 
 			c.mu.Lock()
 			c.sessionInitInFlight = false
-			close(done)
 			c.sessionInitDone = nil
 			if err != nil {
 				c.mu.Unlock()
+				close(done)
+				c.sessionInitWG.Done()
 				return "", err
 			}
 			if c.closed {
 				c.mu.Unlock()
 				closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-				_ = c.closeSessionRemote(closeCtx, resp.SessionID)
+				_ = c.closeSessionRemoteManaged(closeCtx, resp.SessionID)
 				cancel()
+				close(done)
+				c.sessionInitWG.Done()
 				return "", errors.New("client is closed")
 			}
 			if c.sessionID == "" {
@@ -721,6 +734,8 @@ func (c *Client) ensureSession(ctx context.Context) (string, error) {
 			}
 			id := c.sessionID
 			c.mu.Unlock()
+			close(done)
+			c.sessionInitWG.Done()
 			return id, nil
 		}
 		done := c.sessionInitDone
@@ -798,23 +813,29 @@ func (c *Client) watchLoop(ctx context.Context, sessionID string) {
 		return
 	}
 
-	backoff := 100 * time.Millisecond
+	backoff := defaultWatchReconnectInitial
+	disconnectedSince := time.Time{}
+	connectedAt := time.Time{}
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		stream, err := c.grpc.WatchSession(c.rpcContext(ctx))
 		if err != nil {
-			c.failSessionOnWatch(sessionID, err)
-			return
+			if !c.retryWatchReconnect(ctx, sessionID, err, &backoff, &disconnectedSince) {
+				return
+			}
+			continue
 		}
 		if err := stream.Send(&lockrpcpb.ClientWatchMessage{
 			SessionId:       sessionID,
 			ProtocolVersion: protocolVersion,
 		}); err != nil {
 			_ = stream.CloseSend()
-			c.failSessionOnWatch(sessionID, err)
-			return
+			if !c.retryWatchReconnect(ctx, sessionID, err, &backoff, &disconnectedSince) {
+				return
+			}
+			continue
 		}
 		for {
 			ev, err := stream.Recv()
@@ -823,10 +844,15 @@ func (c *Client) watchLoop(ctx context.Context, sessionID string) {
 				if ctx.Err() != nil {
 					return
 				}
+				if !connectedAt.IsZero() && time.Since(connectedAt) >= defaultWatchStableResetAfter {
+					backoff = defaultWatchReconnectInitial
+					disconnectedSince = time.Time{}
+				}
 				break
 			}
 			switch ev.Type {
 			case "WATCH_ESTABLISHED":
+				connectedAt = time.Now()
 				if ev.ServerId != "" {
 					c.observeServer(ev.ServerId)
 				}
@@ -853,16 +879,31 @@ func (c *Client) watchLoop(ctx context.Context, sessionID string) {
 			}
 		}
 
-		// Retry watch quickly; if this does not recover, fail-closed.
-		if err := sleepWithContext(ctx, backoff); err != nil {
-			return
-		}
-		backoff *= 2
-		if backoff > 800*time.Millisecond {
-			c.failSessionOnWatch(sessionID, errors.New("watch stream disconnected"))
+		connectedAt = time.Time{}
+		if !c.retryWatchReconnect(ctx, sessionID, errors.New("watch stream disconnected"), &backoff, &disconnectedSince) {
 			return
 		}
 	}
+}
+
+func (c *Client) retryWatchReconnect(ctx context.Context, sessionID string, cause error, backoff *time.Duration, disconnectedSince *time.Time) bool {
+	if disconnectedSince != nil && disconnectedSince.IsZero() {
+		*disconnectedSince = time.Now()
+	}
+	if err := sleepWithContext(ctx, *backoff); err != nil {
+		return false
+	}
+	if time.Since(*disconnectedSince) >= defaultWatchReconnectFailAfter {
+		c.failSessionOnWatch(sessionID, cause)
+		return false
+	}
+	if *backoff < defaultWatchReconnectMax {
+		*backoff *= 2
+		if *backoff > defaultWatchReconnectMax {
+			*backoff = defaultWatchReconnectMax
+		}
+	}
+	return true
 }
 
 // renewAutoHandles 为自动续约句柄刷新本地 TTL。
@@ -927,12 +968,7 @@ func (c *Client) failSessionOnHeartbeat(sessionID string, cause error) {
 		ErrorCode:  "HEARTBEAT_CONSECUTIVE_FAILURE",
 		OccurredAt: time.Now(),
 	})
-
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = c.closeSessionRemote(ctx, sessionID)
-	}()
+	c.closeSessionRemoteBestEffort(sessionID)
 }
 
 func (c *Client) failSessionOnWatch(sessionID string, cause error) {
@@ -948,10 +984,14 @@ func (c *Client) failSessionOnWatch(sessionID string, cause error) {
 		ErrorCode:  "WATCH_STREAM_DISCONNECTED",
 		OccurredAt: time.Now(),
 	})
+	c.closeSessionRemoteBestEffort(sessionID)
 }
 
 // closeSessionRemote 通知服务端关闭指定 session。
 func (c *Client) closeSessionRemote(ctx context.Context, sessionID string) error {
+	if c.grpc == nil {
+		return nil
+	}
 	resp, err := c.grpc.CloseSession(c.rpcContext(ctx), &lockrpcpb.CloseSessionRequest{
 		SessionId:       sessionID,
 		ProtocolVersion: protocolVersion,
@@ -1206,6 +1246,67 @@ func waitChannelWithContext(ctx context.Context, done <-chan struct{}) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+func waitWaitGroupWithContext(ctx context.Context, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return waitChannelWithContext(ctx, done)
+}
+
+func (c *Client) closeSessionRemoteBestEffort(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	done, started := c.beginManagedRemoteClose(sessionID)
+	if !started {
+		_ = done
+		return
+	}
+	go func() {
+		defer c.finishManagedRemoteClose(sessionID, done)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = c.closeSessionRemote(ctx, sessionID)
+	}()
+}
+
+func (c *Client) closeSessionRemoteManaged(ctx context.Context, sessionID string) error {
+	if sessionID == "" {
+		return nil
+	}
+	done, started := c.beginManagedRemoteClose(sessionID)
+	if !started {
+		return waitChannelWithContext(ctx, done)
+	}
+	defer c.finishManagedRemoteClose(sessionID, done)
+	return c.closeSessionRemote(ctx, sessionID)
+}
+
+func (c *Client) beginManagedRemoteClose(sessionID string) (chan struct{}, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if done, ok := c.remoteCloseInFlight[sessionID]; ok {
+		return done, false
+	}
+	done := make(chan struct{})
+	c.remoteCloseInFlight[sessionID] = done
+	return done, true
+}
+
+func (c *Client) finishManagedRemoteClose(sessionID string, done chan struct{}) {
+	c.mu.Lock()
+	current, ok := c.remoteCloseInFlight[sessionID]
+	if ok && current == done {
+		delete(c.remoteCloseInFlight, sessionID)
+	}
+	c.mu.Unlock()
+	if ok && current == done {
+		close(done)
 	}
 }
 

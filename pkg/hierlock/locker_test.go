@@ -206,3 +206,23 @@ func TestPendingWriterBlocksNewReaders(t *testing.T) {
 		t.Fatalf("writer should acquire after existing reader unlocks, got %v", err)
 	}
 }
+
+func TestSpinUntilLockedWithGateResetsBackoffAfterGateOpens(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	gateOpenAt := time.Now().Add(40 * time.Millisecond)
+	start := time.Now()
+	err := spinUntilLockedWithGate(ctx, func() bool {
+		return time.Now().After(gateOpenAt)
+	}, func() bool {
+		return true
+	})
+	if err != nil {
+		t.Fatalf("expected lock attempt to succeed after gate opens, got %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed > 120*time.Millisecond {
+		t.Fatalf("expected gate-open recovery to avoid excessive backoff, got %s", elapsed)
+	}
+}

@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -193,6 +195,50 @@ func TestHeartbeatExtendsLeaseWithoutSpuriousExpiry(t *testing.T) {
 	}
 }
 
+func TestAcquireWaitTracksHeartbeatExtendedSessionLifetime(t *testing.T) {
+	svc := newLockService(hierlock.MustNew(16), 50*time.Millisecond, time.Second, "srv-test")
+	holder, err := svc.createSession(createSessionRequest{LeaseMS: 200})
+	if err != nil {
+		t.Fatalf("create holder session: %v", err)
+	}
+	waiter, err := svc.createSession(createSessionRequest{LeaseMS: 50})
+	if err != nil {
+		t.Fatalf("create waiter session: %v", err)
+	}
+
+	holdResp, err := svc.acquire(context.Background(), lockRequest{Scope: scopeL2, P1: "tenant", P2: "res", SessionID: holder.SessionID, RequestID: "hold-1"})
+	if err != nil {
+		t.Fatalf("holder acquire: %v", err)
+	}
+
+	resultCh := make(chan error, 1)
+	go func() {
+		resp, err := svc.acquire(context.Background(), lockRequest{Scope: scopeL2, P1: "tenant", P2: "res", SessionID: waiter.SessionID, RequestID: "wait-1"})
+		if err == nil {
+			_, err = svc.release(waiter.SessionID, resp.Token, "wait-rel-1")
+		}
+		resultCh <- err
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	if _, err := svc.heartbeat(waiter.SessionID); err != nil {
+		t.Fatalf("waiter heartbeat: %v", err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if _, err := svc.release(holder.SessionID, holdResp.Token, "hold-rel-1"); err != nil {
+		t.Fatalf("holder release: %v", err)
+	}
+
+	select {
+	case err := <-resultCh:
+		if err != nil {
+			t.Fatalf("expected waiting acquire to survive heartbeat-based lease extension, got: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for acquire after heartbeat-based lease extension")
+	}
+}
+
 func TestAcquireIdempotencyUsesBoundedEviction(t *testing.T) {
 	// 验证：acquire 幂等缓存为有界最旧淘汰。
 	svc := newLockService(hierlock.MustNew(16), time.Second, 5*time.Second, "srv-test")
@@ -256,61 +302,90 @@ func TestAcquireIdempotencyUsesBoundedEviction(t *testing.T) {
 	}
 }
 
-func TestReleaseIdempotencyUsesBoundedEviction(t *testing.T) {
-	// 验证：release 幂等缓存为有界最旧淘汰。
+func TestEvictOldestAcquireCompactsOrderQueue(t *testing.T) {
 	svc := newLockService(hierlock.MustNew(16), time.Second, 5*time.Second, "srv-test")
-	svc.maxIdempotencyEntries = 2
-	sess, err := svc.createSession(createSessionRequest{})
-	if err != nil {
-		t.Fatalf("create session: %v", err)
+	st := &sessionState{
+		acquireByRequest: make(map[string]lockResponse),
+		acquireAt:        make(map[string]time.Time),
+		acquireOrder:     make([]string, 0, 128),
+	}
+	for i := 0; i < 96; i++ {
+		id := fmt.Sprintf("acq-%d", i)
+		st.acquireByRequest[id] = lockResponse{Token: id}
+		st.acquireAt[id] = time.Now()
+		st.acquireOrder = append(st.acquireOrder, id)
+	}
+	for i := 0; i < 64; i++ {
+		svc.evictOldestAcquireLocked(st)
+	}
+	if st.acquireHead != 0 || len(st.acquireOrder) != 32 {
+		t.Fatalf("expected acquire order queue compaction after repeated evictions, head=%d len=%d", st.acquireHead, len(st.acquireOrder))
+	}
+}
+
+func TestEvictOldestReleaseCompactsOrderQueue(t *testing.T) {
+	svc := newLockService(hierlock.MustNew(16), time.Second, 5*time.Second, "srv-test")
+	st := &sessionState{
+		releaseByRequest: make(map[string]string),
+		releaseAt:        make(map[string]time.Time),
+		releaseOrder:     make([]string, 0, 128),
+	}
+	for i := 0; i < 96; i++ {
+		id := fmt.Sprintf("rel-%d", i)
+		st.releaseByRequest[id] = id
+		st.releaseAt[id] = time.Now()
+		st.releaseOrder = append(st.releaseOrder, id)
+	}
+	for i := 0; i < 64; i++ {
+		svc.evictOldestReleaseLocked(st)
+	}
+	if st.releaseHead != 0 || len(st.releaseOrder) != 32 {
+		t.Fatalf("expected release order queue compaction after repeated evictions, head=%d len=%d", st.releaseHead, len(st.releaseOrder))
+	}
+}
+
+func TestAcquireHotspotSingleKeyProgresses(t *testing.T) {
+	svc := newLockService(hierlock.MustNew(16), 2*time.Second, 5*time.Second, "srv-test")
+	const contenders = 12
+	sessions := make([]string, 0, contenders)
+	for i := 0; i < contenders; i++ {
+		sess, err := svc.createSession(createSessionRequest{LeaseMS: 2000})
+		if err != nil {
+			t.Fatalf("create session %d: %v", i, err)
+		}
+		sessions = append(sessions, sess.SessionID)
 	}
 
-	r1, err := svc.acquire(context.Background(), lockRequest{
-		Scope:     scopeL2,
-		P1:        "tenant",
-		P2:        "a",
-		SessionID: sess.SessionID,
-		RequestID: "acq-a",
-	})
-	if err != nil {
-		t.Fatalf("acquire a: %v", err)
+	start := make(chan struct{})
+	errCh := make(chan error, contenders)
+	var wg sync.WaitGroup
+	for i := 0; i < contenders; i++ {
+		wg.Add(1)
+		sessionID := sessions[i]
+		requestID := fmt.Sprintf("hot-acq-%d", i)
+		releaseID := fmt.Sprintf("hot-rel-%d", i)
+		go func(sessionID, requestID, releaseID string) {
+			defer wg.Done()
+			<-start
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			resp, err := svc.acquire(ctx, lockRequest{Scope: scopeL2, P1: "tenant-hot", P2: "res-hot", SessionID: sessionID, RequestID: requestID})
+			if err != nil {
+				errCh <- err
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+			_, err = svc.release(sessionID, resp.Token, releaseID)
+			errCh <- err
+		}(sessionID, requestID, releaseID)
 	}
-	r2, err := svc.acquire(context.Background(), lockRequest{
-		Scope:     scopeL2,
-		P1:        "tenant",
-		P2:        "b",
-		SessionID: sess.SessionID,
-		RequestID: "acq-b",
-	})
-	if err != nil {
-		t.Fatalf("acquire b: %v", err)
-	}
-	r3, err := svc.acquire(context.Background(), lockRequest{
-		Scope:     scopeL2,
-		P1:        "tenant",
-		P2:        "c",
-		SessionID: sess.SessionID,
-		RequestID: "acq-c",
-	})
-	if err != nil {
-		t.Fatalf("acquire c: %v", err)
-	}
-
-	if _, err := svc.release(sess.SessionID, r1.Token, "rel-1"); err != nil {
-		t.Fatalf("release 1: %v", err)
-	}
-	if _, err := svc.release(sess.SessionID, r2.Token, "rel-2"); err != nil {
-		t.Fatalf("release 2: %v", err)
-	}
-	if _, err := svc.release(sess.SessionID, r3.Token, "rel-3"); err != nil {
-		t.Fatalf("release 3: %v", err)
-	}
-
-	// rel-1 should have been evicted; reuse should not be treated idempotent anymore.
-	_, err = svc.release(sess.SessionID, r2.Token, "rel-1")
-	var ae *apiError
-	if !errors.As(err, &ae) || ae.code != "LOCK_NOT_FOUND" {
-		t.Fatalf("expected evicted idempotency key to behave as fresh request, got: %v", err)
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("expected hotspot contenders to serialize successfully, got: %v", err)
+		}
 	}
 }
 
@@ -417,6 +492,9 @@ func TestSubtleConstantTimeMatch(t *testing.T) {
 	}
 	if subtleConstantTimeMatch("abc", "abd") {
 		t.Fatal("expected different tokens not to match")
+	}
+	if subtleConstantTimeMatch("abc", "abcd") {
+		t.Fatal("expected different-length tokens not to match")
 	}
 }
 

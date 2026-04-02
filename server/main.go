@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -48,6 +49,8 @@ const (
 	authHeaderKey   = "authorization"
 	authTokenPrefix = "Bearer "
 )
+
+var errAcquireSessionInvalidated = errors.New("session invalidated while waiting for acquire")
 
 // createSessionRequest 是创建会话的请求体。
 type createSessionRequest struct {
@@ -117,17 +120,20 @@ type expiredInfo struct {
 type sessionState struct {
 	id string
 
-	lease     time.Duration
-	expiresAt time.Time
-	timer     *time.Timer
-	timerSeq  uint64
+	lease       time.Duration
+	expiresAt   time.Time
+	timer       *time.Timer
+	timerSeq    uint64
+	invalidated chan struct{}
 
 	acquireByRequest map[string]lockResponse
 	acquireAt        map[string]time.Time
 	acquireOrder     []string
+	acquireHead      int
 	releaseByRequest map[string]string
 	releaseAt        map[string]time.Time
 	releaseOrder     []string
+	releaseHead      int
 	locksByToken     map[string]*lockHandle
 	watchers         map[uint64]chan *lockrpcpb.ServerEvent
 }
@@ -140,16 +146,16 @@ type lockService struct {
 	serverID     string
 
 	mu              sync.Mutex
-	nextSess        uint64
-	nextLock        uint64
-	nextFence       uint64
+	nextSess        atomic.Uint64
+	nextLock        atomic.Uint64
+	nextFence       atomic.Uint64
 	sessions        map[string]*sessionState
 	tokens          map[string]*lockHandle
 	expiredSessions map[string]expiredInfo
 
 	maxIdempotencyEntries int
 	idempotencyTTL        time.Duration
-	nextWatcherID         uint64
+	nextWatcherID         atomic.Uint64
 	draining              bool
 	metrics               *serverMetrics
 }
@@ -247,6 +253,7 @@ func newLockService(locker *hierlock.HierarchicalLocker, defaultLease, maxLease 
 		expiredSessions:       make(map[string]expiredInfo),
 		maxIdempotencyEntries: maxIdempotencyEntries,
 		idempotencyTTL:        defaultIdempotencyTTL,
+		metrics:               &serverMetrics{},
 	}
 }
 
@@ -269,6 +276,7 @@ func (s *lockService) createSession(req createSessionRequest) (sessionResponse, 
 		id:               sessionID,
 		lease:            lease,
 		expiresAt:        now.Add(lease),
+		invalidated:      make(chan struct{}),
 		acquireByRequest: make(map[string]lockResponse),
 		acquireAt:        make(map[string]time.Time),
 		acquireOrder:     make([]string, 0, 64),
@@ -325,6 +333,33 @@ func (s *lockService) heartbeat(sessionID string) (sessionResponse, error) {
 	return resp, nil
 }
 
+func acquireContextWithSessionInvalidation(parent context.Context, invalidated <-chan struct{}) (context.Context, context.CancelCauseFunc) {
+	ctx, cancel := context.WithCancelCause(parent)
+	if invalidated == nil {
+		return ctx, cancel
+	}
+	go func() {
+		select {
+		case <-invalidated:
+			cancel(errAcquireSessionInvalidated)
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
+func (s *lockService) sessionLookupError(sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if reason := s.expiredReasonLocked(sessionID); reason != "" {
+		return &apiError{status: http.StatusGone, code: errorCodeSessionGone, msg: "session expired: " + reason}
+	}
+	if _, ok := s.sessions[sessionID]; ok {
+		return context.Canceled
+	}
+	return &apiError{status: http.StatusNotFound, code: "SESSION_NOT_FOUND", msg: "session not found"}
+}
+
 // closeSession 执行客户端主动关闭会话流程。
 func (s *lockService) closeSession(sessionID string) bool {
 	return s.expireSession(sessionID, "client_close")
@@ -360,7 +395,7 @@ func (s *lockService) acquire(ctx context.Context, req lockRequest) (lockRespons
 		s.mu.Unlock()
 		return cached, nil
 	}
-	expiresAt := st.expiresAt
+	invalidated := st.invalidated
 	s.mu.Unlock()
 
 	if req.TimeoutMS > 0 {
@@ -368,11 +403,8 @@ func (s *lockService) acquire(ctx context.Context, req lockRequest) (lockRespons
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(req.TimeoutMS)*time.Millisecond)
 		defer cancel()
 	}
-	if dl := time.Until(expiresAt); dl > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, dl)
-		defer cancel()
-	}
+	ctx, cancelAcquireWait := acquireContextWithSessionInvalidation(ctx, invalidated)
+	defer cancelAcquireWait(nil)
 
 	var (
 		unlockFn func()
@@ -390,13 +422,16 @@ func (s *lockService) acquire(ctx context.Context, req lockRequest) (lockRespons
 		return lockResponse{}, errors.New("scope must be one of: l1, l2")
 	}
 	if err != nil {
+		if errors.Is(context.Cause(ctx), errAcquireSessionInvalidated) {
+			return lockResponse{}, s.sessionLookupError(req.SessionID)
+		}
 		return lockResponse{}, err
 	}
 
 	h := &lockHandle{token: s.nextLockToken(), unlock: unlockFn}
 	resp := lockResponse{
 		Token:           h.token,
-		Fence:           atomic.AddUint64(&s.nextFence, 1),
+		Fence:           s.nextFence.Add(1),
 		Scope:           string(req.Scope),
 		P1:              req.P1,
 		P2:              req.P2,
@@ -485,6 +520,10 @@ func (s *lockService) expireSession(sessionID, reason string) bool {
 	s.pruneExpiredLocked(time.Now())
 	if st.timer != nil {
 		st.timer.Stop()
+	}
+	if st.invalidated != nil {
+		close(st.invalidated)
+		st.invalidated = nil
 	}
 	for token, h := range st.locksByToken {
 		handles = append(handles, h)
@@ -610,7 +649,7 @@ func (s *lockService) registerWatcher(sessionID string) (<-chan *lockrpcpb.Serve
 		}
 		return nil, 0, &apiError{status: http.StatusNotFound, code: "SESSION_NOT_FOUND", msg: "session not found"}
 	}
-	id := atomic.AddUint64(&s.nextWatcherID, 1)
+	id := s.nextWatcherID.Add(1)
 	ch := make(chan *lockrpcpb.ServerEvent, 16)
 	st.watchers[id] = ch
 	if s.metrics != nil {
@@ -720,35 +759,56 @@ func (s *lockService) getReleaseIdempotentLocked(st *sessionState, requestID str
 	return token, true
 }
 
+func popOrderQueue(order []string, head int) (string, []string, int) {
+	if head >= len(order) {
+		return "", nil, 0
+	}
+	oldest := order[head]
+	order[head] = ""
+	head++
+	if head >= len(order) {
+		return oldest, nil, 0
+	}
+	if head >= 64 && head*2 >= len(order) {
+		compacted := append([]string(nil), order[head:]...)
+		return oldest, compacted, 0
+	}
+	return oldest, order, head
+}
+
 // evictOldestAcquireLocked 淘汰最旧 acquire request_id。
 func (s *lockService) evictOldestAcquireLocked(st *sessionState) {
-	for len(st.acquireOrder) > 0 {
-		oldest := st.acquireOrder[0]
-		st.acquireOrder = st.acquireOrder[1:]
+	for st.acquireHead < len(st.acquireOrder) {
+		var oldest string
+		oldest, st.acquireOrder, st.acquireHead = popOrderQueue(st.acquireOrder, st.acquireHead)
 		if _, ok := st.acquireByRequest[oldest]; ok {
 			delete(st.acquireByRequest, oldest)
 			delete(st.acquireAt, oldest)
 			return
 		}
 	}
+	st.acquireOrder = nil
+	st.acquireHead = 0
 }
 
 // evictOldestReleaseLocked 淘汰最旧 release request_id。
 func (s *lockService) evictOldestReleaseLocked(st *sessionState) {
-	for len(st.releaseOrder) > 0 {
-		oldest := st.releaseOrder[0]
-		st.releaseOrder = st.releaseOrder[1:]
+	for st.releaseHead < len(st.releaseOrder) {
+		var oldest string
+		oldest, st.releaseOrder, st.releaseHead = popOrderQueue(st.releaseOrder, st.releaseHead)
 		if _, ok := st.releaseByRequest[oldest]; ok {
 			delete(st.releaseByRequest, oldest)
 			delete(st.releaseAt, oldest)
 			return
 		}
 	}
+	st.releaseOrder = nil
+	st.releaseHead = 0
 }
 
 // nextSessionID 生成 session 标识。
 func (s *lockService) nextSessionID() string {
-	n := atomic.AddUint64(&s.nextSess, 1)
+	n := s.nextSess.Add(1)
 	return fmt.Sprintf("sess_%d_%d", time.Now().UnixNano(), n)
 }
 
@@ -758,7 +818,7 @@ func (s *lockService) nextLockToken() string {
 	buf := make([]byte, 16)
 	if _, err := rand.Read(buf); err != nil {
 		// Fallback keeps service available if entropy source is temporarily unavailable.
-		n := atomic.AddUint64(&s.nextLock, 1)
+		n := s.nextLock.Add(1)
 		return fmt.Sprintf("lk_%d_%d", time.Now().UnixNano(), n)
 	}
 	return "lk_" + hex.EncodeToString(buf)
@@ -1049,14 +1109,22 @@ func grpcServerAuthStreamInterceptor(expectedToken string, m *serverMetrics) grp
 }
 
 func subtleConstantTimeMatch(a, b string) bool {
-	if len(a) != len(b) {
-		return false
+	maxLen := len(a)
+	if len(b) > maxLen {
+		maxLen = len(b)
 	}
-	var diff byte
-	for i := 0; i < len(a); i++ {
-		diff |= a[i] ^ b[i]
+	var diff byte = byte(len(a) ^ len(b))
+	for i := 0; i < maxLen; i++ {
+		var av, bv byte
+		if i < len(a) {
+			av = a[i]
+		}
+		if i < len(b) {
+			bv = b[i]
+		}
+		diff |= av ^ bv
 	}
-	return diff == 0
+	return subtle.ConstantTimeByteEq(diff, 0) == 1
 }
 
 func grpcServerRateUnaryInterceptor(limiter *rateLimiter, m *serverMetrics) grpc.UnaryServerInterceptor {

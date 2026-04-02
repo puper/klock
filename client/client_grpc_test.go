@@ -18,17 +18,20 @@ import (
 type fakeLockRPCServer struct {
 	lockrpcpb.UnimplementedLockServiceServer
 
-	mu               sync.Mutex
-	watchers         []chan *lockrpcpb.ServerEvent
-	authToken        string
-	releaseFailFor   int
-	releaseCalls     int
-	releaseRequestID []string
-	failAcquireP2    string
-	failAcquireCode  codes.Code
-	acquireTimeoutMS []int64
-	acquireDeadlines []time.Duration
-	acquireDelay     time.Duration
+	mu                         sync.Mutex
+	watchers                   []chan *lockrpcpb.ServerEvent
+	closeSessionCalls          int
+	authToken                  string
+	releaseFailFor             int
+	releaseCalls               int
+	releaseRequestID           []string
+	failAcquireP2              string
+	failAcquireCode            codes.Code
+	acquireTimeoutMS           []int64
+	acquireDeadlines           []time.Duration
+	acquireDelay               time.Duration
+	createSessionDelay         time.Duration
+	watchBreakAfterEstablished bool
 }
 
 func (f *fakeLockRPCServer) requireAuth(ctx context.Context) error {
@@ -53,6 +56,16 @@ func (f *fakeLockRPCServer) requireAuth(ctx context.Context) error {
 func (f *fakeLockRPCServer) CreateSession(ctx context.Context, _ *lockrpcpb.CreateSessionRequest) (*lockrpcpb.SessionResponse, error) {
 	if err := f.requireAuth(ctx); err != nil {
 		return nil, err
+	}
+	f.mu.Lock()
+	delay := f.createSessionDelay
+	f.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
 	}
 	return &lockrpcpb.SessionResponse{
 		SessionId:       "sess-1",
@@ -190,6 +203,9 @@ func (f *fakeLockRPCServer) CloseSession(ctx context.Context, _ *lockrpcpb.Close
 	if err := f.requireAuth(ctx); err != nil {
 		return nil, err
 	}
+	f.mu.Lock()
+	f.closeSessionCalls++
+	f.mu.Unlock()
 	return &lockrpcpb.CloseSessionResponse{
 		Closed:          true,
 		ServerId:        "srv-a",
@@ -218,6 +234,12 @@ func (f *fakeLockRPCServer) WatchSession(stream lockrpcpb.LockService_WatchSessi
 		ServerId:        "srv-a",
 		ProtocolVersion: protocolVersion,
 	}); err != nil {
+		return nil
+	}
+	f.mu.Lock()
+	breakAfterEstablished := f.watchBreakAfterEstablished
+	f.mu.Unlock()
+	if breakAfterEstablished {
 		return nil
 	}
 	for {
@@ -402,5 +424,198 @@ func TestLockUncertainFailureTriggersFailClosedSession(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected held lock to be fail-closed after uncertain lock failure")
+	}
+}
+
+func TestWatchDisconnectTriggersBestEffortCloseSession(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer lis.Close()
+
+	grpcSrv := grpc.NewServer()
+	fake := &fakeLockRPCServer{
+		authToken:                  "test-token",
+		watchBreakAfterEstablished: true,
+	}
+	lockrpcpb.RegisterLockServiceServer(grpcSrv, fake)
+	go grpcSrv.Serve(lis)
+	defer grpcSrv.Stop()
+
+	c := NewWithConfig("grpc://"+lis.Addr().String(), Config{
+		SessionLease:      15 * time.Second,
+		HeartbeatInterval: 30 * time.Second,
+		HeartbeatTimeout:  500 * time.Millisecond,
+		LocalTTL:          15 * time.Second,
+		AuthToken:         "test-token",
+	})
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = c.Close(closeCtx)
+	}()
+
+	h, err := c.Lock(context.Background(), "tenant-1", "res-watch-break", LockOption{})
+	if err != nil {
+		t.Fatalf("lock failed: %v", err)
+	}
+
+	select {
+	case ev := <-h.Done():
+		if ev.Type != EventSessionGone {
+			t.Fatalf("expected session_gone, got %s", ev.Type)
+		}
+		if ev.ErrorCode != "WATCH_STREAM_DISCONNECTED" {
+			t.Fatalf("expected WATCH_STREAM_DISCONNECTED, got %s", ev.ErrorCode)
+		}
+	case <-time.After(7 * time.Second):
+		t.Fatal("expected watch disconnect to invalidate lock")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		fake.mu.Lock()
+		calls := fake.closeSessionCalls
+		fake.mu.Unlock()
+		if calls >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("expected best-effort CloseSession after watch disconnect")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestRemoteCloseDeduplicatedPerSession(t *testing.T) {
+	c := &Client{
+		remoteCloseInFlight: make(map[string]chan struct{}),
+	}
+
+	ch1, started1 := c.beginManagedRemoteClose("sess-1")
+	if !started1 {
+		t.Fatal("expected first close attempt to start")
+	}
+	ch2, started2 := c.beginManagedRemoteClose("sess-1")
+	if started2 {
+		t.Fatal("expected second close attempt to be deduplicated")
+	}
+	if ch1 != ch2 {
+		t.Fatal("expected deduplicated close attempts to share the same completion channel")
+	}
+	c.finishManagedRemoteClose("sess-1", ch1)
+	select {
+	case <-ch2:
+	case <-time.After(time.Second):
+		t.Fatal("expected deduplicated close waiter to be released")
+	}
+}
+
+func TestUncertainFailureStormDeduplicatesRemoteClose(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer lis.Close()
+
+	grpcSrv := grpc.NewServer()
+	fake := &fakeLockRPCServer{authToken: "test-token"}
+	lockrpcpb.RegisterLockServiceServer(grpcSrv, fake)
+	go grpcSrv.Serve(lis)
+	defer grpcSrv.Stop()
+
+	c := NewWithConfig("grpc://"+lis.Addr().String(), Config{
+		SessionLease:      2 * time.Second,
+		HeartbeatInterval: 200 * time.Millisecond,
+		HeartbeatTimeout:  500 * time.Millisecond,
+		LocalTTL:          2 * time.Second,
+		AuthToken:         "test-token",
+	})
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = c.Close(closeCtx)
+	}()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.failClosedOnUncertainLockFailure("sess-1", status.Error(codes.Internal, "simulated uncertain failure"))
+		}()
+	}
+	wg.Wait()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		fake.mu.Lock()
+		calls := fake.closeSessionCalls
+		fake.mu.Unlock()
+		if calls == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			fake.mu.Lock()
+			defer fake.mu.Unlock()
+			t.Fatalf("expected failure storm to produce exactly one CloseSession call, got %d", fake.closeSessionCalls)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.closeSessionCalls != 1 {
+		t.Fatalf("expected deduplicated remote close count to remain 1, got %d", fake.closeSessionCalls)
+	}
+}
+
+func TestCloseWaitsForInFlightCreateSessionCleanup(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer lis.Close()
+
+	grpcSrv := grpc.NewServer()
+	fake := &fakeLockRPCServer{
+		authToken:          "test-token",
+		createSessionDelay: 150 * time.Millisecond,
+	}
+	lockrpcpb.RegisterLockServiceServer(grpcSrv, fake)
+	go grpcSrv.Serve(lis)
+	defer grpcSrv.Stop()
+
+	c := NewWithConfig("grpc://"+lis.Addr().String(), Config{
+		SessionLease:      2 * time.Second,
+		HeartbeatInterval: 200 * time.Millisecond,
+		HeartbeatTimeout:  500 * time.Millisecond,
+		LocalTTL:          2 * time.Second,
+		AuthToken:         "test-token",
+	})
+
+	lockDone := make(chan error, 1)
+	go func() {
+		_, err := c.Lock(context.Background(), "tenant-1", "res-close-race", LockOption{})
+		lockDone <- err
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := c.Close(closeCtx); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	err = <-lockDone
+	if err == nil || !strings.Contains(err.Error(), "client is closed") {
+		t.Fatalf("expected lock to observe closed client, got %v", err)
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.closeSessionCalls != 1 {
+		t.Fatalf("expected exactly one CloseSession call after in-flight createSession cleanup, got %d", fake.closeSessionCalls)
 	}
 }
