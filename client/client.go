@@ -1,20 +1,21 @@
 package client
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
-	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/puper/klock/pkg/lockrpcpb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 )
 
 // Scope 表示锁粒度。
@@ -27,8 +28,6 @@ const (
 	ScopeL2 Scope = "l2"
 
 	protocolVersion = "1"
-	headerServerID  = "X-Lock-Server-ID"
-	headerProtocol  = "X-Lock-Protocol-Version"
 )
 
 const (
@@ -100,6 +99,8 @@ type Config struct {
 	LocalTTL time.Duration
 	// LocalSweepInterval controls local TTL expiration scan frequency.
 	LocalSweepInterval time.Duration
+	// AuthToken is sent as Bearer token via gRPC metadata header "authorization".
+	AuthToken string
 }
 
 // Client 是锁服务 Go SDK 主体。
@@ -110,13 +111,15 @@ type Config struct {
 // 3. Close 后实例不可复用。
 type Client struct {
 	baseURL string
-	http    *http.Client
+	grpc    lockrpcpb.LockServiceClient
+	conn    *grpc.ClientConn
 	cfg     Config
 
 	mu                  sync.Mutex
 	sessionID           string
 	serverID            string
 	heartbeatStop       context.CancelFunc
+	watchStop           context.CancelFunc
 	sweepStop           context.CancelFunc
 	sessionInitInFlight bool
 	sessionInitDone     chan struct{}
@@ -125,6 +128,7 @@ type Client struct {
 	closed              bool
 	nextReq             uint64
 	handles             map[string]*LockHandle
+	initErr             error
 }
 
 // LockHandle 是一次加锁成功后的本地句柄。
@@ -179,11 +183,6 @@ func (h *LockHandle) fail(ev LockEvent) {
 	})
 }
 
-// createSessionRequest 是创建会话请求体。
-type createSessionRequest struct {
-	LeaseMS int64 `json:"lease_ms,omitempty"`
-}
-
 // sessionResponse 是会话接口响应体。
 type sessionResponse struct {
 	SessionID       string `json:"session_id"`
@@ -212,15 +211,7 @@ type lockResponse struct {
 	ProtocolVersion string `json:"protocol_version"`
 }
 
-// errorResponse 是服务端错误响应体。
-type errorResponse struct {
-	Error           string `json:"error"`
-	Code            string `json:"code,omitempty"`
-	ServerID        string `json:"server_id,omitempty"`
-	ProtocolVersion string `json:"protocol_version,omitempty"`
-}
-
-// APIError 封装服务端 HTTP 错误与业务错误码。
+// APIError 封装服务端 RPC 错误与业务错误码。
 type APIError struct {
 	Status          int
 	Code            string
@@ -241,15 +232,12 @@ func (e *APIError) Error() string {
 }
 
 // New 使用默认配置创建客户端。
-func New(baseURL string, httpClient *http.Client) *Client {
-	return NewWithConfig(baseURL, httpClient, Config{})
+func New(baseURL string) *Client {
+	return NewWithConfig(baseURL, Config{})
 }
 
 // NewWithConfig 使用给定配置创建客户端并启动本地 TTL 扫描协程。
-func NewWithConfig(baseURL string, httpClient *http.Client, cfg Config) *Client {
-	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 15 * time.Second}
-	}
+func NewWithConfig(baseURL string, cfg Config) *Client {
 	if cfg.HeartbeatInterval <= 0 {
 		cfg.HeartbeatInterval = 1 * time.Second
 	}
@@ -266,12 +254,23 @@ func NewWithConfig(baseURL string, httpClient *http.Client, cfg Config) *Client 
 		cfg.LocalSweepInterval = defaultSweepInterval
 	}
 
+	target := strings.TrimSpace(strings.TrimPrefix(baseURL, "grpc://"))
 	c := &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		http:    httpClient,
+		baseURL: target,
 		cfg:     cfg,
 		handles: make(map[string]*LockHandle),
 		bgDone:  make(chan struct{}),
+	}
+
+	conn, err := grpc.Dial(
+		target,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		c.initErr = err
+	} else {
+		c.conn = conn
+		c.grpc = lockrpcpb.NewLockServiceClient(conn)
 	}
 	close(c.bgDone)
 
@@ -296,6 +295,9 @@ func (c *Client) LockL1(ctx context.Context, p1 string, opt LockOption) (*LockHa
 // 1. 支持 Timeout=0 的 until 模式；
 // 2. 支持 Timeout>0 的总时长自动重试模式。
 func (c *Client) lockWithScope(ctx context.Context, scope Scope, p1, p2 string, opt LockOption) (*LockHandle, error) {
+	if c.initErr != nil {
+		return nil, c.initErr
+	}
 	waitCtx := ctx
 	cancel := func() {}
 	if opt.Timeout > 0 {
@@ -429,30 +431,23 @@ func (c *Client) newHandle(resp lockResponse, opt LockOption) *LockHandle {
 // unlockHandle 执行解锁请求并更新本地句柄状态。
 func (c *Client) unlockHandle(ctx context.Context, h *LockHandle) error {
 	releaseReqID := c.nextRequestID("rel")
-	q := url.Values{}
-	q.Set("session_id", h.sessionID)
-	q.Set("request_id", releaseReqID)
-
-	u := c.baseURL + "/v1/locks/" + h.Token + "?" + q.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	resp, err := c.grpc.Release(c.rpcContext(ctx), &lockrpcpb.ReleaseRequest{
+		SessionId:       h.sessionID,
+		Token:           h.Token,
+		RequestId:       releaseReqID,
+		ProtocolVersion: protocolVersion,
+		ExpectedServer:  c.currentServerID(),
+	})
 	if err != nil {
 		return err
 	}
-	c.decorateRequest(req)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	c.observeServer(resp.Header.Get(headerServerID))
-	if resp.StatusCode != http.StatusNoContent {
-		err = decodeHTTPError(resp)
+	if resp.Error != nil {
+		err := c.apiErrorFromRPC(resp.Error)
 		c.handleAPIError(h.sessionID, err)
 		return err
 	}
 
+	c.observeServer(resp.ServerId)
 	c.mu.Lock()
 	delete(c.handles, h.Token)
 	c.mu.Unlock()
@@ -470,10 +465,12 @@ func (c *Client) Close(ctx context.Context) error {
 	c.closed = true
 	sessionID := c.sessionID
 	hbStop := c.heartbeatStop
+	wStop := c.watchStop
 	sweepStop := c.sweepStop
 	bgDone := c.bgDone
 	c.sessionID = ""
 	c.heartbeatStop = nil
+	c.watchStop = nil
 	c.sweepStop = nil
 	affected := c.collectHandlesLocked(sessionID)
 	c.mu.Unlock()
@@ -492,6 +489,9 @@ func (c *Client) Close(ctx context.Context) error {
 	if hbStop != nil {
 		hbStop()
 	}
+	if wStop != nil {
+		wStop()
+	}
 	if sweepStop != nil {
 		sweepStop()
 	}
@@ -499,10 +499,16 @@ func (c *Client) Close(ctx context.Context) error {
 		return err
 	}
 	if sessionID == "" {
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
 		return nil
 	}
-
-	return c.closeSessionRemote(ctx, sessionID)
+	err := c.closeSessionRemote(ctx, sessionID)
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
+	return err
 }
 
 // ensureSession 确保客户端有可用 session。
@@ -551,6 +557,10 @@ func (c *Client) ensureSession(ctx context.Context) (string, error) {
 				c.heartbeatStop = cancel
 				c.markBGStartLocked()
 				go c.heartbeatLoop(hbCtx, resp.SessionID)
+				wCtx, wCancel := context.WithCancel(context.Background())
+				c.watchStop = wCancel
+				c.markBGStartLocked()
+				go c.watchLoop(wCtx, resp.SessionID)
 			}
 			id := c.sessionID
 			c.mu.Unlock()
@@ -577,8 +587,12 @@ func (c *Client) invalidateSession(sessionID string) {
 	if c.heartbeatStop != nil {
 		c.heartbeatStop()
 	}
+	if c.watchStop != nil {
+		c.watchStop()
+	}
 	c.sessionID = ""
 	c.heartbeatStop = nil
+	c.watchStop = nil
 }
 
 // heartbeatLoop 定期续约会话。
@@ -617,6 +631,75 @@ func (c *Client) heartbeatLoop(ctx context.Context, sessionID string) {
 				c.failSessionOnHeartbeat(sessionID, err)
 				return
 			}
+		}
+	}
+}
+
+func (c *Client) watchLoop(ctx context.Context, sessionID string) {
+	defer c.markBGDone()
+	if c.grpc == nil {
+		return
+	}
+
+	backoff := 100 * time.Millisecond
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		stream, err := c.grpc.WatchSession(c.rpcContext(ctx))
+		if err != nil {
+			c.failSessionOnWatch(sessionID, err)
+			return
+		}
+		if err := stream.Send(&lockrpcpb.ClientWatchMessage{
+			SessionId:       sessionID,
+			ProtocolVersion: protocolVersion,
+		}); err != nil {
+			c.failSessionOnWatch(sessionID, err)
+			return
+		}
+		for {
+			ev, err := stream.Recv()
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				break
+			}
+			switch ev.Type {
+			case "WATCH_ESTABLISHED":
+				if ev.ServerId != "" {
+					c.observeServer(ev.ServerId)
+				}
+			case "SESSION_INVALIDATED":
+				c.invalidateSession(sessionID)
+				c.broadcastSessionEvent(sessionID, LockEvent{
+					Type:       EventSessionGone,
+					Message:    ev.Message,
+					SessionID:  sessionID,
+					ErrorCode:  ev.Code,
+					OccurredAt: time.Now(),
+				})
+				return
+			case "PROTOCOL_MISMATCH":
+				c.broadcastEvent(LockEvent{
+					Type:       EventProtocolMismatch,
+					Message:    ev.Message,
+					ErrorCode:  ev.Code,
+					OccurredAt: time.Now(),
+				})
+				return
+			}
+		}
+
+		// Retry watch quickly; if this does not recover, fail-closed.
+		if err := sleepWithContext(ctx, backoff); err != nil {
+			return
+		}
+		backoff *= 2
+		if backoff > 800*time.Millisecond {
+			c.failSessionOnWatch(sessionID, errors.New("watch stream disconnected"))
+			return
 		}
 	}
 }
@@ -691,25 +774,36 @@ func (c *Client) failSessionOnHeartbeat(sessionID string, cause error) {
 	}()
 }
 
+func (c *Client) failSessionOnWatch(sessionID string, cause error) {
+	c.invalidateSession(sessionID)
+	msg := "watch stream disconnected; lock invalidated"
+	if cause != nil {
+		msg = msg + ": " + cause.Error()
+	}
+	c.broadcastSessionEvent(sessionID, LockEvent{
+		Type:       EventSessionGone,
+		Message:    msg,
+		SessionID:  sessionID,
+		ErrorCode:  "WATCH_STREAM_DISCONNECTED",
+		OccurredAt: time.Now(),
+	})
+}
+
 // closeSessionRemote 通知服务端关闭指定 session。
 func (c *Client) closeSessionRemote(ctx context.Context, sessionID string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/v1/sessions/"+sessionID, nil)
+	resp, err := c.grpc.CloseSession(c.rpcContext(ctx), &lockrpcpb.CloseSessionRequest{
+		SessionId:       sessionID,
+		ProtocolVersion: protocolVersion,
+		ExpectedServer:  c.currentServerID(),
+	})
 	if err != nil {
 		return err
 	}
-	c.decorateRequest(req)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	c.observeServer(resp.Header.Get(headerServerID))
-
-	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+	c.observeServer(resp.ServerId)
+	if resp.Error == nil || resp.Error.Code == "SESSION_NOT_FOUND" || resp.Error.Code == "SESSION_GONE" {
 		return nil
 	}
-	err = decodeHTTPError(resp)
+	err = c.apiErrorFromRPC(resp.Error)
 	c.handleAPIError(sessionID, err)
 	return err
 }
@@ -717,33 +811,26 @@ func (c *Client) closeSessionRemote(ctx context.Context, sessionID string) error
 // createSession 调用服务端创建会话接口。
 func (c *Client) createSession(ctx context.Context) (sessionResponse, error) {
 	lease := c.effectiveServerLease()
-	body, err := json.Marshal(createSessionRequest{LeaseMS: durationMS(lease)})
+	resp, err := c.grpc.CreateSession(c.rpcContext(ctx), &lockrpcpb.CreateSessionRequest{
+		LeaseMs:         durationMS(lease),
+		ProtocolVersion: protocolVersion,
+		ExpectedServer:  c.currentServerID(),
+	})
 	if err != nil {
 		return sessionResponse{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/sessions", bytes.NewReader(body))
-	if err != nil {
-		return sessionResponse{}, err
-	}
-	c.decorateRequest(req)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return sessionResponse{}, err
-	}
-	defer resp.Body.Close()
-
-	c.observeServer(resp.Header.Get(headerServerID))
-
-	if resp.StatusCode != http.StatusOK {
-		err := decodeHTTPError(resp)
+	if resp.Error != nil {
+		err := c.apiErrorFromRPC(resp.Error)
 		c.handleAPIError("", err)
 		return sessionResponse{}, err
 	}
 
-	var out sessionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return sessionResponse{}, err
+	out := sessionResponse{
+		SessionID:       resp.SessionId,
+		LeaseMS:         resp.LeaseMs,
+		ExpiresAt:       resp.ExpiresAt,
+		ServerID:        resp.ServerId,
+		ProtocolVersion: resp.ProtocolVersion,
 	}
 	if out.SessionID == "" {
 		return sessionResponse{}, errors.New("lock service returned empty session id")
@@ -771,68 +858,50 @@ func (c *Client) effectiveServerLease() time.Duration {
 
 // heartbeat 发送一次会话续约请求。
 func (c *Client) heartbeat(ctx context.Context, sessionID string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/sessions/"+sessionID+"/heartbeat", nil)
+	resp, err := c.grpc.Heartbeat(c.rpcContext(ctx), &lockrpcpb.HeartbeatRequest{
+		SessionId:       sessionID,
+		ProtocolVersion: protocolVersion,
+		ExpectedServer:  c.currentServerID(),
+	})
 	if err != nil {
 		return err
 	}
-	c.decorateRequest(req)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	c.observeServer(resp.Header.Get(headerServerID))
-	if resp.StatusCode == http.StatusOK {
+	c.observeServer(resp.ServerId)
+	if resp.Error == nil {
 		return nil
 	}
-	return decodeHTTPError(resp)
+	return c.apiErrorFromRPC(resp.Error)
 }
 
-// acquire 发起加锁 HTTP 请求。
+// acquire 发起加锁 RPC 请求。
 func (c *Client) acquire(ctx context.Context, reqBody lockRequest) (lockResponse, error) {
-	body, err := json.Marshal(reqBody)
+	resp, err := c.grpc.Acquire(c.rpcContext(ctx), &lockrpcpb.LockRequest{
+		Scope:           string(reqBody.Scope),
+		P1:              reqBody.P1,
+		P2:              reqBody.P2,
+		TimeoutMs:       reqBody.TimeoutMS,
+		SessionId:       reqBody.SessionID,
+		RequestId:       reqBody.RequestID,
+		ProtocolVersion: protocolVersion,
+		ExpectedServer:  c.currentServerID(),
+	})
 	if err != nil {
 		return lockResponse{}, err
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/locks", bytes.NewReader(body))
-	if err != nil {
-		return lockResponse{}, err
+	c.observeServer(resp.ServerId)
+	if resp.Error != nil {
+		return lockResponse{}, c.apiErrorFromRPC(resp.Error)
 	}
-	c.decorateRequest(req)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return lockResponse{}, err
-	}
-	defer resp.Body.Close()
-
-	c.observeServer(resp.Header.Get(headerServerID))
-
-	if resp.StatusCode != http.StatusOK {
-		return lockResponse{}, decodeHTTPError(resp)
-	}
-
-	var out lockResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return lockResponse{}, err
-	}
-	if out.Token == "" {
+	if resp.Token == "" {
 		return lockResponse{}, errors.New("lock service returned empty token")
 	}
-	return out, nil
-}
-
-// decorateRequest 注入协议头与期望 server id。
-func (c *Client) decorateRequest(req *http.Request) {
-	req.Header.Set(headerProtocol, protocolVersion)
-	c.mu.Lock()
-	serverID := c.serverID
-	c.mu.Unlock()
-	if serverID != "" {
-		req.Header.Set(headerServerID, serverID)
-	}
+	return lockResponse{
+		Token:           resp.Token,
+		Fence:           resp.Fence,
+		SessionID:       resp.SessionId,
+		ServerID:        resp.ServerId,
+		ProtocolVersion: resp.ProtocolVersion,
+	}, nil
 }
 
 // observeServer 观察服务实例 ID 变化并执行本地失效处理。
@@ -855,8 +924,12 @@ func (c *Client) observeServer(serverID string) {
 	if c.heartbeatStop != nil {
 		c.heartbeatStop()
 	}
+	if c.watchStop != nil {
+		c.watchStop()
+	}
 	c.sessionID = ""
 	c.heartbeatStop = nil
+	c.watchStop = nil
 	c.serverID = serverID
 	affected := c.collectHandlesLocked(sessionID)
 	c.mu.Unlock()
@@ -928,29 +1001,33 @@ func (c *Client) nextRequestID(prefix string) string {
 	return prefix + "_" + strconv.FormatInt(time.Now().UnixNano(), 10) + "_" + strconv.FormatUint(n, 10)
 }
 
-// decodeHTTPError 解析服务端错误响应体并转换为 APIError。
-func decodeHTTPError(resp *http.Response) error {
-	data, _ := io.ReadAll(resp.Body)
-	if len(data) == 0 {
-		return &APIError{Status: resp.StatusCode, Message: "empty error response", ServerID: resp.Header.Get(headerServerID), ProtocolVersion: resp.Header.Get(headerProtocol)}
+func (c *Client) currentServerID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.serverID
+}
+
+func (c *Client) rpcContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	var er errorResponse
-	if err := json.Unmarshal(data, &er); err == nil {
-		msg := er.Error
-		if msg == "" {
-			msg = strings.TrimSpace(string(data))
-		}
-		sid := er.ServerID
-		if sid == "" {
-			sid = resp.Header.Get(headerServerID)
-		}
-		pv := er.ProtocolVersion
-		if pv == "" {
-			pv = resp.Header.Get(headerProtocol)
-		}
-		return &APIError{Status: resp.StatusCode, Code: er.Code, Message: msg, ServerID: sid, ProtocolVersion: pv}
+	if strings.TrimSpace(c.cfg.AuthToken) == "" {
+		return ctx
 	}
-	return &APIError{Status: resp.StatusCode, Message: strings.TrimSpace(string(data)), ServerID: resp.Header.Get(headerServerID), ProtocolVersion: resp.Header.Get(headerProtocol)}
+	return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+strings.TrimSpace(c.cfg.AuthToken))
+}
+
+func (c *Client) apiErrorFromRPC(es *lockrpcpb.ErrorStatus) error {
+	if es == nil {
+		return nil
+	}
+	return &APIError{
+		Status:          int(es.Status),
+		Code:            es.Code,
+		Message:         es.Message,
+		ServerID:        es.ServerId,
+		ProtocolVersion: es.ProtocolVersion,
+	}
 }
 
 // durationMS 将 duration 转为毫秒数；<=0 返回 0。

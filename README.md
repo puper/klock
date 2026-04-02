@@ -3,7 +3,7 @@
 `klock` 是一个基于 Go 的两级层级锁实现，包含：
 
 1. 本地进程内层级锁 `pkg/hierlock`
-2. 单节点 HTTP 锁服务 `server`
+2. 单节点 gRPC 锁服务 `server`
 3. Go 客户端 SDK `client`
 
 当前实现重点是安全优先：客户端先失效、服务端后回收。
@@ -28,12 +28,15 @@
 .
 ├── client/              # Go SDK
 ├── docs/                # 设计与场景分析文档
+├── proto/               # gRPC/protobuf 协议定义
 ├── pkg/hierlock/        # 进程内层级锁
-├── server/              # HTTP 锁服务
+├── pkg/lockrpcpb/       # protoc 生成的 Go 代码
+├── server/              # gRPC 锁服务
 └── go.mod
 ```
 
 详细设计与逐场景分析见：[docs/design-scenarios.md](docs/design-scenarios.md)。
+gRPC 双向流迁移设计见：[docs/grpc-migration.md](docs/grpc-migration.md)。
 
 ## 快速开始
 
@@ -51,6 +54,9 @@ go run ./server
 2. `LOCK_SERVER_SHARDS`（默认 `1024`）
 3. `LOCK_SERVER_DEFAULT_LEASE_MS`（默认 `8000`）
 4. `LOCK_SERVER_MAX_LEASE_MS`（默认 `60000`）
+5. `LOCK_SERVER_AUTH_TOKEN`（可选，设置后启用 token 鉴权）
+6. `LOCK_SERVER_RATE_LIMIT_RPS`（默认 `200`）
+7. `LOCK_SERVER_RATE_LIMIT_BURST`（默认 `400`）
 
 ### 2) 客户端使用
 
@@ -60,32 +66,19 @@ package main
 import (
 	"context"
 	"fmt"
-	"net"
-	"net/http"
 	"time"
 
 	"github.com/puper/klock/client"
 )
 
 func main() {
-	httpClient := &http.Client{
-		Timeout: 3 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     90 * time.Second,
-			DialContext: (&net.Dialer{
-				Timeout: 1 * time.Second,
-			}).DialContext,
-		},
-	}
-
-	c := client.NewWithConfig("http://127.0.0.1:8080", httpClient, client.Config{
+	c := client.NewWithConfig("grpc://127.0.0.1:8080", client.Config{
 		SessionLease:      8 * time.Second,
 		HeartbeatInterval: 1 * time.Second,
 		HeartbeatTimeout:  1500 * time.Millisecond,
 		LocalTTL:          3 * time.Second,
 		ServerLeaseBuffer: 5 * time.Second,
+		AuthToken:         "replace-with-your-token", // 对应 LOCK_SERVER_AUTH_TOKEN
 	})
 	defer func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -150,23 +143,20 @@ func main() {
 1. 客户端本地比服务端更早失效，减少异常写入窗口
 2. 服务端租约兜底，最终回收锁
 
-## HTTP 接口
+## gRPC 通信
 
-### Session
+客户端支持 `grpc://host:port` 地址，启用 gRPC unary + `WatchSession` 双向流。
+当服务端优雅重启时，会向会话 watch 流广播 `SESSION_INVALIDATED`，客户端会立刻触发 `Done()` 失效事件。
+服务端默认开启基础限流（可配置），并支持 `authorization: Bearer <token>` 鉴权。
 
-1. `POST /v1/sessions`
-2. `POST /v1/sessions/{id}/heartbeat`
-3. `DELETE /v1/sessions/{id}`
+## 协议生成
 
-### Lock
+协议源文件：`proto/lock.proto`。
+如修改协议，请重新生成：
 
-1. `POST /v1/locks`
-2. `DELETE /v1/locks/{token}?session_id=...&request_id=...`
-
-请求头：
-
-1. `X-Lock-Protocol-Version`
-2. `X-Lock-Server-ID`（客户端会带上期望实例）
+```bash
+./scripts/gen-proto.sh
+```
 
 幂等说明（每个 session）：
 
@@ -179,6 +169,22 @@ func main() {
 ```bash
 go test ./...
 go test -race ./...
+```
+
+压测（示例）：
+
+```bash
+LOCK_SERVER_AUTH_TOKEN=bench-token \
+LOCK_SERVER_RATE_LIMIT_RPS=5000 \
+LOCK_SERVER_RATE_LIMIT_BURST=10000 \
+go run ./server
+
+go run ./cmd/loadtest \
+  -addr grpc://127.0.0.1:8080 \
+  -token bench-token \
+  -concurrency 64 \
+  -duration 30s \
+  -keyspace 2048
 ```
 
 ## 适用场景与边界

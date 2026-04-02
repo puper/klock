@@ -1,0 +1,108 @@
+syntax = "proto3";
+
+package klock.v1;
+
+option go_package = "github.com/puper/klock/pkg/lockrpcpb;lockrpcpb";
+
+message ErrorStatus {
+  int32 status = 1;
+  string code = 2;
+  string message = 3;
+  string server_id = 4;
+  string protocol_version = 5;
+}
+
+message CreateSessionRequest {
+  int64 lease_ms = 1;
+  string protocol_version = 2;
+  string expected_server = 3;
+}
+
+message SessionResponse {
+  string session_id = 1;
+  int64 lease_ms = 2;
+  string expires_at = 3;
+  string server_id = 4;
+  string protocol_version = 5;
+  ErrorStatus error = 6;
+}
+
+message HeartbeatRequest {
+  string session_id = 1;
+  string protocol_version = 2;
+  string expected_server = 3;
+}
+
+message LockRequest {
+  string scope = 1;
+  string p1 = 2;
+  string p2 = 3;
+  int64 timeout_ms = 4;
+  string session_id = 5;
+  string request_id = 6;
+  string protocol_version = 7;
+  string expected_server = 8;
+}
+
+message LockResponse {
+  string token = 1;
+  uint64 fence = 2;
+  string scope = 3;
+  string p1 = 4;
+  string p2 = 5;
+  string session_id = 6;
+  string server_id = 7;
+  string protocol_version = 8;
+  ErrorStatus error = 9;
+}
+
+message ReleaseRequest {
+  string session_id = 1;
+  string token = 2;
+  string request_id = 3;
+  string protocol_version = 4;
+  string expected_server = 5;
+}
+
+message ReleaseResponse {
+  bool ok = 1;
+  string server_id = 2;
+  string protocol_version = 3;
+  ErrorStatus error = 4;
+}
+
+message CloseSessionRequest {
+  string session_id = 1;
+  string protocol_version = 2;
+  string expected_server = 3;
+}
+
+message CloseSessionResponse {
+  bool closed = 1;
+  string server_id = 2;
+  string protocol_version = 3;
+  ErrorStatus error = 4;
+}
+
+message ClientWatchMessage {
+  string session_id = 1;
+  string protocol_version = 2;
+}
+
+message ServerEvent {
+  string type = 1;
+  string message = 2;
+  string code = 3;
+  string session_id = 4;
+  string server_id = 5;
+  string protocol_version = 6;
+}
+
+service LockService {
+  rpc CreateSession(CreateSessionRequest) returns (SessionResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (SessionResponse);
+  rpc Acquire(LockRequest) returns (LockResponse);
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
+  rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
+  rpc WatchSession(stream ClientWatchMessage) returns (stream ServerEvent);
+}

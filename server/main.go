@@ -4,20 +4,27 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/puper/klock/pkg/hierlock"
+	"github.com/puper/klock/pkg/lockrpcpb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 )
 
 // lockScope 表示锁粒度：L1（前缀级）或 L2（资源级）。
@@ -30,14 +37,14 @@ const (
 	scopeL2 lockScope = "l2"
 
 	protocolVersion      = "1"
-	headerServerID       = "X-Lock-Server-ID"
-	headerProtocol       = "X-Lock-Protocol-Version"
 	errorCodeSessionGone = "SESSION_GONE"
 
-	maxJSONBodyBytes      = 1 << 20
 	maxIdempotencyEntries = 4096
 	expiredRetention      = 10 * time.Minute
 	maxExpiredSessions    = 10000
+
+	authHeaderKey   = "authorization"
+	authTokenPrefix = "Bearer "
 )
 
 // createSessionRequest 是创建会话的请求体。
@@ -72,14 +79,6 @@ type lockResponse struct {
 	P1              string `json:"p1"`
 	P2              string `json:"p2,omitempty"`
 	SessionID       string `json:"session_id"`
-	ServerID        string `json:"server_id"`
-	ProtocolVersion string `json:"protocol_version"`
-}
-
-// errorResponse 是统一错误返回结构。
-type errorResponse struct {
-	Error           string `json:"error"`
-	Code            string `json:"code,omitempty"`
 	ServerID        string `json:"server_id"`
 	ProtocolVersion string `json:"protocol_version"`
 }
@@ -126,6 +125,7 @@ type sessionState struct {
 	releaseByRequest map[string]string
 	releaseOrder     []string
 	locksByToken     map[string]*lockHandle
+	watchers         map[uint64]chan *lockrpcpb.ServerEvent
 }
 
 // lockService 是 HTTP 接口背后的核心状态机。
@@ -144,18 +144,139 @@ type lockService struct {
 	expiredSessions map[string]expiredInfo
 
 	maxIdempotencyEntries int
+	nextWatcherID         uint64
+	draining              bool
+	metrics               *serverMetrics
+}
+
+type serverMetrics struct {
+	unaryCalls          atomic.Int64
+	unaryFailures       atomic.Int64
+	streamCalls         atomic.Int64
+	streamFailures      atomic.Int64
+	activeWatchers      atomic.Int64
+	sessionInvalidation atomic.Int64
+	authFailures        atomic.Int64
+	rateLimited         atomic.Int64
+}
+
+type tokenBucket struct {
+	mu       sync.Mutex
+	tokens   float64
+	last     time.Time
+	rate     float64
+	burst    float64
+	inactive time.Time
+}
+
+func newTokenBucket(rps, burst int) *tokenBucket {
+	rate := float64(rps)
+	if rate <= 0 {
+		rate = 1
+	}
+	b := float64(burst)
+	if b <= 0 {
+		b = rate
+	}
+	now := time.Now()
+	return &tokenBucket{
+		tokens:   b,
+		last:     now,
+		rate:     rate,
+		burst:    b,
+		inactive: now,
+	}
+}
+
+func (b *tokenBucket) allow(now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delta := now.Sub(b.last).Seconds()
+	if delta > 0 {
+		b.tokens += delta * b.rate
+		if b.tokens > b.burst {
+			b.tokens = b.burst
+		}
+	}
+	b.last = now
+	b.inactive = now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens -= 1
+	return true
+}
+
+func (b *tokenBucket) idleFor(now time.Time) time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return now.Sub(b.inactive)
+}
+
+type rateLimiter struct {
+	mu          sync.Mutex
+	limitRPS    int
+	burst       int
+	entries     map[string]*tokenBucket
+	lastCleanup time.Time
+}
+
+func newRateLimiter(limitRPS, burst int) *rateLimiter {
+	if limitRPS <= 0 {
+		limitRPS = 200
+	}
+	if burst <= 0 {
+		burst = limitRPS * 2
+	}
+	return &rateLimiter{
+		limitRPS:    limitRPS,
+		burst:       burst,
+		entries:     make(map[string]*tokenBucket),
+		lastCleanup: time.Now(),
+	}
+}
+
+func (r *rateLimiter) allow(key string, now time.Time) bool {
+	r.mu.Lock()
+	b, ok := r.entries[key]
+	if !ok {
+		b = newTokenBucket(r.limitRPS, r.burst)
+		r.entries[key] = b
+	}
+	shouldCleanup := now.Sub(r.lastCleanup) > time.Minute
+	if shouldCleanup {
+		r.lastCleanup = now
+	}
+	r.mu.Unlock()
+
+	allowed := b.allow(now)
+
+	if shouldCleanup {
+		r.cleanup(now)
+	}
+	return allowed
+}
+
+func (r *rateLimiter) cleanup(now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key, b := range r.entries {
+		if b.idleFor(now) > 2*time.Minute {
+			delete(r.entries, key)
+		}
+	}
 }
 
 // newLockService 构造服务实例。
 func newLockService(locker *hierlock.HierarchicalLocker, defaultLease, maxLease time.Duration, serverID string) *lockService {
 	return &lockService{
-		locker:          locker,
-		defaultLease:    defaultLease,
-		maxLease:        maxLease,
-		serverID:        serverID,
-		sessions:        make(map[string]*sessionState),
-		tokens:          make(map[string]*lockHandle),
-		expiredSessions: make(map[string]expiredInfo),
+		locker:                locker,
+		defaultLease:          defaultLease,
+		maxLease:              maxLease,
+		serverID:              serverID,
+		sessions:              make(map[string]*sessionState),
+		tokens:                make(map[string]*lockHandle),
+		expiredSessions:       make(map[string]expiredInfo),
 		maxIdempotencyEntries: maxIdempotencyEntries,
 	}
 }
@@ -184,9 +305,14 @@ func (s *lockService) createSession(req createSessionRequest) (sessionResponse, 
 		releaseByRequest: make(map[string]string),
 		releaseOrder:     make([]string, 0, 64),
 		locksByToken:     make(map[string]*lockHandle),
+		watchers:         make(map[uint64]chan *lockrpcpb.ServerEvent),
 	}
 
 	s.mu.Lock()
+	if s.draining {
+		s.mu.Unlock()
+		return sessionResponse{}, &apiError{status: http.StatusServiceUnavailable, code: "SERVER_DRAINING", msg: "server is draining for restart"}
+	}
 	s.sessions[sessionID] = st
 	// Install timer only after session is visible in map to avoid missing expiry
 	// when very short leases fire before registration.
@@ -246,6 +372,10 @@ func (s *lockService) acquire(ctx context.Context, req lockRequest) (lockRespons
 	}
 
 	s.mu.Lock()
+	if s.draining {
+		s.mu.Unlock()
+		return lockResponse{}, &apiError{status: http.StatusServiceUnavailable, code: "SERVER_DRAINING", msg: "server is draining for restart"}
+	}
 	st, ok := s.sessions[req.SessionID]
 	if !ok {
 		reason := s.expiredReasonLocked(req.SessionID)
@@ -371,6 +501,7 @@ func (s *lockService) release(sessionID, token, requestID string) (bool, error) 
 // expireSession 使 session 失效并回收该 session 下的全部锁。
 func (s *lockService) expireSession(sessionID, reason string) bool {
 	var handles []*lockHandle
+	var watcherChans []chan *lockrpcpb.ServerEvent
 
 	s.mu.Lock()
 	st, ok := s.sessions[sessionID]
@@ -388,10 +519,35 @@ func (s *lockService) expireSession(sessionID, reason string) bool {
 		handles = append(handles, h)
 		delete(s.tokens, token)
 	}
+	for id, ch := range st.watchers {
+		watcherChans = append(watcherChans, ch)
+		delete(st.watchers, id)
+		if s.metrics != nil {
+			s.metrics.activeWatchers.Add(-1)
+		}
+	}
 	s.mu.Unlock()
 
 	for _, h := range handles {
 		h.safeUnlock()
+	}
+	ev := lockrpcpb.ServerEvent{
+		Type:            "SESSION_INVALIDATED",
+		Message:         "session invalidated: " + reason,
+		Code:            "SESSION_GONE",
+		SessionId:       sessionID,
+		ServerId:        s.serverID,
+		ProtocolVersion: protocolVersion,
+	}
+	if s.metrics != nil {
+		s.metrics.sessionInvalidation.Add(1)
+	}
+	for _, ch := range watcherChans {
+		select {
+		case ch <- &ev:
+		default:
+		}
+		close(ch)
 	}
 	return true
 }
@@ -469,6 +625,64 @@ func (s *lockService) onSessionTimer(sessionID string, seq uint64) {
 	s.expireSession(sessionID, "lease_expired")
 }
 
+func (s *lockService) registerWatcher(sessionID string) (<-chan *lockrpcpb.ServerEvent, uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.draining {
+		return nil, 0, &apiError{status: http.StatusServiceUnavailable, code: "SERVER_DRAINING", msg: "server is draining for restart"}
+	}
+	st, ok := s.sessions[sessionID]
+	if !ok {
+		reason := s.expiredReasonLocked(sessionID)
+		if reason != "" {
+			return nil, 0, &apiError{status: http.StatusGone, code: errorCodeSessionGone, msg: "session expired: " + reason}
+		}
+		return nil, 0, &apiError{status: http.StatusNotFound, code: "SESSION_NOT_FOUND", msg: "session not found"}
+	}
+	id := atomic.AddUint64(&s.nextWatcherID, 1)
+	ch := make(chan *lockrpcpb.ServerEvent, 16)
+	st.watchers[id] = ch
+	if s.metrics != nil {
+		s.metrics.activeWatchers.Add(1)
+	}
+	return ch, id, nil
+}
+
+func (s *lockService) unregisterWatcher(sessionID string, watcherID uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.sessions[sessionID]
+	if !ok {
+		return
+	}
+	ch, ok := st.watchers[watcherID]
+	if !ok {
+		return
+	}
+	delete(st.watchers, watcherID)
+	if s.metrics != nil {
+		s.metrics.activeWatchers.Add(-1)
+	}
+	close(ch)
+}
+
+func (s *lockService) drainForRestart() {
+	s.mu.Lock()
+	if s.draining {
+		s.mu.Unlock()
+		return
+	}
+	s.draining = true
+	sessionIDs := make([]string, 0, len(s.sessions))
+	for sid := range s.sessions {
+		sessionIDs = append(sessionIDs, sid)
+	}
+	s.mu.Unlock()
+	for _, sid := range sessionIDs {
+		s.expireSession(sid, "server_restarting")
+	}
+}
+
 // putAcquireIdempotentLocked 写入 acquire 幂等缓存并执行有界淘汰。
 func (s *lockService) putAcquireIdempotentLocked(st *sessionState, requestID string, resp lockResponse) {
 	if _, exists := st.acquireByRequest[requestID]; exists {
@@ -543,193 +757,378 @@ func (s *lockService) nextLockToken() string {
 	return "lk_" + hex.EncodeToString(buf)
 }
 
-// newHandler 组装 HTTP 路由。
-func newHandler(svc *lockService) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set(headerServerID, svc.serverID)
-		w.Header().Set(headerProtocol, protocolVersion)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-
-	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, r *http.Request) {
-		if err := checkProtocol(r); err != nil {
-			writeAPIError(w, svc, err)
-			return
-		}
-		switch r.Method {
-		case http.MethodPost:
-			var req createSessionRequest
-			if r.Body != nil {
-				if err := json.NewDecoder(io.LimitReader(r.Body, maxJSONBodyBytes)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-					writeError(w, svc, http.StatusBadRequest, "BAD_REQUEST", "invalid JSON body")
-					return
-				}
-			}
-			resp, err := svc.createSession(req)
-			if err != nil {
-				writeError(w, svc, http.StatusBadRequest, "BAD_REQUEST", err.Error())
-				return
-			}
-			writeJSON(w, svc, http.StatusOK, resp)
-		default:
-			writeError(w, svc, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
-		}
-	})
-
-	mux.HandleFunc("/v1/sessions/", func(w http.ResponseWriter, r *http.Request) {
-		if err := checkProtocol(r); err != nil {
-			writeAPIError(w, svc, err)
-			return
-		}
-		if err := checkServerID(r, svc.serverID); err != nil {
-			writeAPIError(w, svc, err)
-			return
-		}
-
-		path := strings.TrimPrefix(r.URL.Path, "/v1/sessions/")
-		if path == "" {
-			writeError(w, svc, http.StatusBadRequest, "BAD_REQUEST", "session id is required")
-			return
-		}
-		if strings.HasSuffix(path, "/heartbeat") {
-			sessionID := strings.TrimSuffix(path, "/heartbeat")
-			sessionID = strings.TrimSuffix(sessionID, "/")
-			if r.Method != http.MethodPost {
-				writeError(w, svc, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
-				return
-			}
-			resp, err := svc.heartbeat(sessionID)
-			if err != nil {
-				writeAPIError(w, svc, err)
-				return
-			}
-			writeJSON(w, svc, http.StatusOK, resp)
-			return
-		}
-		if r.Method != http.MethodDelete {
-			writeError(w, svc, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
-			return
-		}
-		if !svc.closeSession(path) {
-			writeError(w, svc, http.StatusNotFound, "SESSION_NOT_FOUND", "session not found")
-			return
-		}
-		w.Header().Set(headerServerID, svc.serverID)
-		w.Header().Set(headerProtocol, protocolVersion)
-		w.WriteHeader(http.StatusNoContent)
-	})
-
-	mux.HandleFunc("/v1/locks", func(w http.ResponseWriter, r *http.Request) {
-		if err := checkProtocol(r); err != nil {
-			writeAPIError(w, svc, err)
-			return
-		}
-		if err := checkServerID(r, svc.serverID); err != nil {
-			writeAPIError(w, svc, err)
-			return
-		}
-		if r.Method != http.MethodPost {
-			writeError(w, svc, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
-			return
-		}
-
-		var req lockRequest
-		if err := json.NewDecoder(io.LimitReader(r.Body, maxJSONBodyBytes)).Decode(&req); err != nil {
-			writeError(w, svc, http.StatusBadRequest, "BAD_REQUEST", "invalid JSON body")
-			return
-		}
-
-		resp, err := svc.acquire(r.Context(), req)
-		if err != nil {
-			writeAPIError(w, svc, err)
-			return
-		}
-		writeJSON(w, svc, http.StatusOK, resp)
-	})
-
-	mux.HandleFunc("/v1/locks/", func(w http.ResponseWriter, r *http.Request) {
-		if err := checkProtocol(r); err != nil {
-			writeAPIError(w, svc, err)
-			return
-		}
-		if err := checkServerID(r, svc.serverID); err != nil {
-			writeAPIError(w, svc, err)
-			return
-		}
-		if r.Method != http.MethodDelete {
-			writeError(w, svc, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
-			return
-		}
-		token := strings.TrimPrefix(r.URL.Path, "/v1/locks/")
-		if token == "" {
-			writeError(w, svc, http.StatusBadRequest, "BAD_REQUEST", "token is required")
-			return
-		}
-		sessionID := r.URL.Query().Get("session_id")
-		requestID := r.URL.Query().Get("request_id")
-		ok, err := svc.release(sessionID, token, requestID)
-		if err != nil {
-			writeAPIError(w, svc, err)
-			return
-		}
-		if !ok {
-			writeError(w, svc, http.StatusNotFound, "LOCK_NOT_FOUND", "lock token not found")
-			return
-		}
-		w.Header().Set(headerServerID, svc.serverID)
-		w.Header().Set(headerProtocol, protocolVersion)
-		w.WriteHeader(http.StatusNoContent)
-	})
-
-	return mux
+type grpcServer struct {
+	lockrpcpb.UnimplementedLockServiceServer
+	svc *lockService
 }
 
-// checkProtocol 校验协议版本。
-func checkProtocol(r *http.Request) error {
-	v := r.Header.Get(headerProtocol)
+func newGRPCServer(svc *lockService) *grpcServer {
+	return &grpcServer{svc: svc}
+}
+
+func (g *grpcServer) rpcErr(status int, code, msg string) *lockrpcpb.ErrorStatus {
+	return &lockrpcpb.ErrorStatus{
+		Status:          int32(status),
+		Code:            code,
+		Message:         msg,
+		ServerId:        g.svc.serverID,
+		ProtocolVersion: protocolVersion,
+	}
+}
+
+func (g *grpcServer) rpcFromErr(err error) *lockrpcpb.ErrorStatus {
+	if err == nil {
+		return nil
+	}
+	var ae *apiError
+	if errors.As(err, &ae) {
+		return g.rpcErr(ae.status, ae.code, ae.msg)
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return g.rpcErr(http.StatusConflict, "LOCK_TIMEOUT", "lock wait timeout or canceled")
+	}
+	return g.rpcErr(http.StatusBadRequest, "BAD_REQUEST", err.Error())
+}
+
+func checkProtocolValue(v string) error {
 	if v == "" || v == protocolVersion {
 		return nil
 	}
 	return &apiError{status: http.StatusConflict, code: "PROTOCOL_MISMATCH", msg: "protocol version mismatch"}
 }
 
-// checkServerID 校验客户端期望的服务实例 ID。
-func checkServerID(r *http.Request, current string) error {
-	expected := r.Header.Get(headerServerID)
+func checkServerValue(expected, current string) error {
 	if expected == "" || expected == current {
 		return nil
 	}
 	return &apiError{status: http.StatusConflict, code: "SERVER_INSTANCE_MISMATCH", msg: "server instance changed"}
 }
 
-// writeJSON 写入 JSON 响应并补充协议头。
-func writeJSON(w http.ResponseWriter, svc *lockService, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set(headerServerID, svc.serverID)
-	w.Header().Set(headerProtocol, protocolVersion)
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+func (g *grpcServer) CreateSession(_ context.Context, req *lockrpcpb.CreateSessionRequest) (*lockrpcpb.SessionResponse, error) {
+	if err := checkProtocolValue(req.ProtocolVersion); err != nil {
+		return &lockrpcpb.SessionResponse{Error: g.rpcFromErr(err)}, nil
+	}
+	if err := checkServerValue(req.ExpectedServer, g.svc.serverID); err != nil {
+		return &lockrpcpb.SessionResponse{Error: g.rpcFromErr(err)}, nil
+	}
+	resp, err := g.svc.createSession(createSessionRequest{LeaseMS: req.LeaseMs})
+	if err != nil {
+		return &lockrpcpb.SessionResponse{Error: g.rpcFromErr(err)}, nil
+	}
+	return &lockrpcpb.SessionResponse{
+		SessionId:       resp.SessionID,
+		LeaseMs:         resp.LeaseMS,
+		ExpiresAt:       resp.ExpiresAt,
+		ServerId:        resp.ServerID,
+		ProtocolVersion: resp.ProtocolVersion,
+	}, nil
 }
 
-// writeError 写结构化错误响应。
-func writeError(w http.ResponseWriter, svc *lockService, status int, code, msg string) {
-	writeJSON(w, svc, status, errorResponse{Error: msg, Code: code, ServerID: svc.serverID, ProtocolVersion: protocolVersion})
+func (g *grpcServer) Heartbeat(_ context.Context, req *lockrpcpb.HeartbeatRequest) (*lockrpcpb.SessionResponse, error) {
+	if err := checkProtocolValue(req.ProtocolVersion); err != nil {
+		return &lockrpcpb.SessionResponse{Error: g.rpcFromErr(err)}, nil
+	}
+	if err := checkServerValue(req.ExpectedServer, g.svc.serverID); err != nil {
+		return &lockrpcpb.SessionResponse{Error: g.rpcFromErr(err)}, nil
+	}
+	resp, err := g.svc.heartbeat(req.SessionId)
+	if err != nil {
+		return &lockrpcpb.SessionResponse{Error: g.rpcFromErr(err)}, nil
+	}
+	return &lockrpcpb.SessionResponse{
+		SessionId:       resp.SessionID,
+		LeaseMs:         resp.LeaseMS,
+		ExpiresAt:       resp.ExpiresAt,
+		ServerId:        resp.ServerID,
+		ProtocolVersion: resp.ProtocolVersion,
+	}, nil
 }
 
-// writeAPIError 将内部错误映射为对外可消费的 API 错误。
-func writeAPIError(w http.ResponseWriter, svc *lockService, err error) {
-	var ae *apiError
-	if errors.As(err, &ae) {
-		writeError(w, svc, ae.status, ae.code, ae.msg)
-		return
+func (g *grpcServer) Acquire(ctx context.Context, req *lockrpcpb.LockRequest) (*lockrpcpb.LockResponse, error) {
+	if err := checkProtocolValue(req.ProtocolVersion); err != nil {
+		return &lockrpcpb.LockResponse{Error: g.rpcFromErr(err)}, nil
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		writeError(w, svc, http.StatusConflict, "LOCK_TIMEOUT", "lock wait timeout or canceled")
-		return
+	if err := checkServerValue(req.ExpectedServer, g.svc.serverID); err != nil {
+		return &lockrpcpb.LockResponse{Error: g.rpcFromErr(err)}, nil
 	}
-	writeError(w, svc, http.StatusBadRequest, "BAD_REQUEST", err.Error())
+	resp, err := g.svc.acquire(ctx, lockRequest{
+		Scope:     lockScope(req.Scope),
+		P1:        req.P1,
+		P2:        req.P2,
+		TimeoutMS: req.TimeoutMs,
+		SessionID: req.SessionId,
+		RequestID: req.RequestId,
+	})
+	if err != nil {
+		return &lockrpcpb.LockResponse{Error: g.rpcFromErr(err)}, nil
+	}
+	return &lockrpcpb.LockResponse{
+		Token:           resp.Token,
+		Fence:           resp.Fence,
+		Scope:           resp.Scope,
+		P1:              resp.P1,
+		P2:              resp.P2,
+		SessionId:       resp.SessionID,
+		ServerId:        resp.ServerID,
+		ProtocolVersion: resp.ProtocolVersion,
+	}, nil
+}
+
+func (g *grpcServer) Release(_ context.Context, req *lockrpcpb.ReleaseRequest) (*lockrpcpb.ReleaseResponse, error) {
+	if err := checkProtocolValue(req.ProtocolVersion); err != nil {
+		return &lockrpcpb.ReleaseResponse{Error: g.rpcFromErr(err)}, nil
+	}
+	if err := checkServerValue(req.ExpectedServer, g.svc.serverID); err != nil {
+		return &lockrpcpb.ReleaseResponse{Error: g.rpcFromErr(err)}, nil
+	}
+	ok, err := g.svc.release(req.SessionId, req.Token, req.RequestId)
+	if err != nil {
+		return &lockrpcpb.ReleaseResponse{Error: g.rpcFromErr(err)}, nil
+	}
+	return &lockrpcpb.ReleaseResponse{
+		Ok:              ok,
+		ServerId:        g.svc.serverID,
+		ProtocolVersion: protocolVersion,
+	}, nil
+}
+
+func (g *grpcServer) CloseSession(_ context.Context, req *lockrpcpb.CloseSessionRequest) (*lockrpcpb.CloseSessionResponse, error) {
+	if err := checkProtocolValue(req.ProtocolVersion); err != nil {
+		return &lockrpcpb.CloseSessionResponse{Error: g.rpcFromErr(err)}, nil
+	}
+	if err := checkServerValue(req.ExpectedServer, g.svc.serverID); err != nil {
+		return &lockrpcpb.CloseSessionResponse{Error: g.rpcFromErr(err)}, nil
+	}
+	closed := g.svc.closeSession(req.SessionId)
+	if !closed {
+		return &lockrpcpb.CloseSessionResponse{
+			Closed:          false,
+			ServerId:        g.svc.serverID,
+			ProtocolVersion: protocolVersion,
+			Error:           g.rpcErr(http.StatusNotFound, "SESSION_NOT_FOUND", "session not found"),
+		}, nil
+	}
+	return &lockrpcpb.CloseSessionResponse{
+		Closed:          true,
+		ServerId:        g.svc.serverID,
+		ProtocolVersion: protocolVersion,
+	}, nil
+}
+
+func (g *grpcServer) WatchSession(stream lockrpcpb.LockService_WatchSessionServer) error {
+	first, err := stream.Recv()
+	if err != nil {
+		return nil
+	}
+	if err := checkProtocolValue(first.ProtocolVersion); err != nil {
+		ev := g.rpcFromErr(err)
+		_ = stream.Send(&lockrpcpb.ServerEvent{
+			Type:            "PROTOCOL_MISMATCH",
+			Message:         ev.Message,
+			Code:            ev.Code,
+			ServerId:        g.svc.serverID,
+			ProtocolVersion: protocolVersion,
+		})
+		return nil
+	}
+	sessionID := first.SessionId
+	wch, watcherID, err := g.svc.registerWatcher(sessionID)
+	if err != nil {
+		ev := g.rpcFromErr(err)
+		_ = stream.Send(&lockrpcpb.ServerEvent{
+			Type:            "SESSION_INVALIDATED",
+			Message:         ev.Message,
+			Code:            ev.Code,
+			SessionId:       sessionID,
+			ServerId:        g.svc.serverID,
+			ProtocolVersion: protocolVersion,
+		})
+		return nil
+	}
+	defer g.svc.unregisterWatcher(sessionID, watcherID)
+
+	if err := stream.Send(&lockrpcpb.ServerEvent{
+		Type:            "WATCH_ESTABLISHED",
+		Message:         "watch established",
+		SessionId:       sessionID,
+		ServerId:        g.svc.serverID,
+		ProtocolVersion: protocolVersion,
+	}); err != nil {
+		return nil
+	}
+
+	recvDone := make(chan struct{})
+	go func() {
+		defer close(recvDone)
+		for {
+			if _, err := stream.Recv(); err != nil {
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case <-recvDone:
+			return nil
+		case ev, ok := <-wch:
+			if !ok {
+				return nil
+			}
+			if err := stream.Send(ev); err != nil {
+				return nil
+			}
+		}
+	}
+}
+
+func authTokenFromContext(ctx context.Context) string {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ""
+	}
+	values := md.Get(authHeaderKey)
+	if len(values) == 0 {
+		return ""
+	}
+	v := strings.TrimSpace(values[0])
+	if strings.HasPrefix(strings.ToLower(v), strings.ToLower(authTokenPrefix)) {
+		return strings.TrimSpace(v[len(authTokenPrefix):])
+	}
+	return v
+}
+
+func peerKeyFromContext(ctx context.Context) string {
+	p, ok := peer.FromContext(ctx)
+	if !ok || p == nil || p.Addr == nil {
+		return "unknown"
+	}
+	return p.Addr.String()
+}
+
+func grpcServerAuthUnaryInterceptor(expectedToken string, m *serverMetrics) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if expectedToken == "" {
+			return handler(ctx, req)
+		}
+		got := authTokenFromContext(ctx)
+		if subtleConstantTimeMatch(got, expectedToken) {
+			return handler(ctx, req)
+		}
+		m.authFailures.Add(1)
+		return nil, status.Error(codes.Unauthenticated, "missing or invalid auth token")
+	}
+}
+
+func grpcServerAuthStreamInterceptor(expectedToken string, m *serverMetrics) grpc.StreamServerInterceptor {
+	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		if expectedToken == "" {
+			return handler(srv, ss)
+		}
+		got := authTokenFromContext(ss.Context())
+		if subtleConstantTimeMatch(got, expectedToken) {
+			return handler(srv, ss)
+		}
+		m.authFailures.Add(1)
+		return status.Error(codes.Unauthenticated, "missing or invalid auth token")
+	}
+}
+
+func subtleConstantTimeMatch(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var diff byte
+	for i := 0; i < len(a); i++ {
+		diff |= a[i] ^ b[i]
+	}
+	return diff == 0
+}
+
+func grpcServerRateUnaryInterceptor(limiter *rateLimiter, m *serverMetrics) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		key := info.FullMethod + "|" + peerKeyFromContext(ctx)
+		if limiter.allow(key, time.Now()) {
+			return handler(ctx, req)
+		}
+		m.rateLimited.Add(1)
+		return nil, status.Error(codes.ResourceExhausted, "rate limit exceeded")
+	}
+}
+
+func grpcServerRateStreamInterceptor(limiter *rateLimiter, m *serverMetrics) grpc.StreamServerInterceptor {
+	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		key := info.FullMethod + "|" + peerKeyFromContext(ss.Context())
+		if limiter.allow(key, time.Now()) {
+			return handler(srv, ss)
+		}
+		m.rateLimited.Add(1)
+		return status.Error(codes.ResourceExhausted, "rate limit exceeded")
+	}
+}
+
+func grpcServerUnaryMetricsInterceptor(m *serverMetrics) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		start := time.Now()
+		m.unaryCalls.Add(1)
+		resp, err := handler(ctx, req)
+		duration := time.Since(start)
+		code := "OK"
+		if err != nil {
+			m.unaryFailures.Add(1)
+			code = "TRANSPORT_ERROR"
+		} else if withErr, ok := resp.(interface{ GetError() *lockrpcpb.ErrorStatus }); ok && withErr.GetError() != nil {
+			m.unaryFailures.Add(1)
+			code = withErr.GetError().GetCode()
+		}
+		log.Printf("grpc_unary method=%s code=%s duration_ms=%d", info.FullMethod, code, duration.Milliseconds())
+		return resp, err
+	}
+}
+
+func grpcServerStreamMetricsInterceptor(m *serverMetrics) grpc.StreamServerInterceptor {
+	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		start := time.Now()
+		m.streamCalls.Add(1)
+		err := handler(srv, ss)
+		duration := time.Since(start)
+		code := "OK"
+		if err != nil {
+			m.streamFailures.Add(1)
+			code = "STREAM_ERROR"
+		}
+		log.Printf("grpc_stream method=%s code=%s duration_ms=%d", info.FullMethod, code, duration.Milliseconds())
+		return err
+	}
+}
+
+func startMetricsReporter(ctx context.Context, m *serverMetrics) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	report := func() {
+		log.Printf(
+			"metrics unary_calls=%d unary_failures=%d stream_calls=%d stream_failures=%d auth_failures=%d rate_limited=%d active_watchers=%d session_invalidations=%d",
+			m.unaryCalls.Load(),
+			m.unaryFailures.Load(),
+			m.streamCalls.Load(),
+			m.streamFailures.Load(),
+			m.authFailures.Load(),
+			m.rateLimited.Load(),
+			m.activeWatchers.Load(),
+			m.sessionInvalidation.Load(),
+		)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			report()
+			return
+		case <-ticker.C:
+			report()
+		}
+	}
 }
 
 // newServerID 生成服务实例 ID，用于客户端实例粘性校验。
@@ -741,12 +1140,15 @@ func newServerID() string {
 	return "srv_" + hex.EncodeToString(buf)
 }
 
-// main 启动 HTTP 锁服务。
+// main 启动 gRPC 锁服务。
 func main() {
 	addr := envOrDefault("LOCK_SERVER_ADDR", ":8080")
 	shardCount := envAsInt("LOCK_SERVER_SHARDS", 1024)
 	defaultLeaseMS := envAsInt("LOCK_SERVER_DEFAULT_LEASE_MS", 8000)
 	maxLeaseMS := envAsInt("LOCK_SERVER_MAX_LEASE_MS", 60000)
+	authToken := os.Getenv("LOCK_SERVER_AUTH_TOKEN")
+	rateLimitRPS := envAsInt("LOCK_SERVER_RATE_LIMIT_RPS", 200)
+	rateLimitBurst := envAsInt("LOCK_SERVER_RATE_LIMIT_BURST", 400)
 
 	locker, err := hierlock.New(shardCount)
 	if err != nil {
@@ -755,19 +1157,50 @@ func main() {
 
 	serverID := newServerID()
 	svc := newLockService(locker, time.Duration(defaultLeaseMS)*time.Millisecond, time.Duration(maxLeaseMS)*time.Millisecond, serverID)
-	server := &http.Server{
-		Addr:              addr,
-		Handler:           newHandler(svc),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    1 << 20,
-	}
+	metrics := &serverMetrics{}
+	svc.metrics = metrics
+	limiter := newRateLimiter(rateLimitRPS, rateLimitBurst)
+	grpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(
+			grpcServerAuthUnaryInterceptor(authToken, metrics),
+			grpcServerRateUnaryInterceptor(limiter, metrics),
+			grpcServerUnaryMetricsInterceptor(metrics),
+		),
+		grpc.ChainStreamInterceptor(
+			grpcServerAuthStreamInterceptor(authToken, metrics),
+			grpcServerRateStreamInterceptor(limiter, metrics),
+			grpcServerStreamMetricsInterceptor(metrics),
+		),
+	)
+	lockrpcpb.RegisterLockServiceServer(grpcServer, newGRPCServer(svc))
 
-	log.Printf("lock server listening on %s server_id=%s protocol=%s", addr, serverID, protocolVersion)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("listen: %v", err)
+	}
+	defer lis.Close()
+
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- grpcServer.Serve(lis)
+	}()
+
+	log.Printf("lock grpc server listening on %s server_id=%s protocol=%s auth_enabled=%t rate_rps=%d rate_burst=%d", addr, serverID, protocolVersion, authToken != "", rateLimitRPS, rateLimitBurst)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	go startMetricsReporter(ctx, metrics)
+
+	select {
+	case <-ctx.Done():
+		log.Printf("shutdown signal received; draining sessions")
+		svc.drainForRestart()
+		time.Sleep(200 * time.Millisecond)
+		grpcServer.GracefulStop()
+	case err := <-serveErr:
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 }
 

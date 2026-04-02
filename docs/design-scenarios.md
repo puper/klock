@@ -33,8 +33,8 @@
 ### 2.1 组件
 
 1. `pkg/hierlock`：进程内层级锁核心。
-2. `server`：单节点 HTTP 锁服务，管理 session、token、幂等缓存。
-3. `client`：Go SDK，管理 session 生命周期、heartbeat、本地 TTL。
+2. `server`：单节点 gRPC 锁服务，管理 session、token、幂等缓存。
+3. `client`：Go SDK，管理 session 生命周期、watch/heartbeat、本地 TTL。
 
 ### 2.2 核心对象
 
@@ -142,8 +142,9 @@
 
 预期：
 
-1. 客户端从 header 识别 server id 变化。
-2. 本地 session 失效，锁事件通知 `server_changed`。
+1. 优雅重启时，服务端通过 `WatchSession` 广播 `SESSION_INVALIDATED(server_restarting)`。
+2. 本地 session 失效，锁事件通知 `session_gone`。
+3. 非优雅中断时，客户端通过 stream 断开触发 fail-closed。
 
 结论：符合预期。锁状态不会跨重启保留。
 
@@ -168,13 +169,13 @@
 
 1. 单节点单点故障。
 2. 内存态模型，重启即丢锁态与幂等态。
-3. `fence` 为进程内单调，重启后从头计数；如果业务侧仅按数字比较且不区分 server epoch，可能误判新旧。
+3. `fence` 为进程内单调，重启后从头计数；如果业务侧仅按数字比较且不区分 `server_id`，可能误判新旧。
 
 ### 5.2 工程级风险
 
 1. 客户端若未调用 `Close(ctx)`，后台 goroutine（heartbeat/sweep）会泄漏。
-2. 认证与鉴权缺失，默认不适合不可信网络直接暴露。
-3. 缺少内建指标（QPS、等待时延、活跃 session、活跃锁、过期原因分布等），生产可观测性不足。
+2. 默认鉴权为 Bearer token（`LOCK_SERVER_AUTH_TOKEN`）；不可信网络建议进一步配合 mTLS。
+3. 已有内建拦截器日志与指标快照；仍建议补充 Prometheus 与可视化看板。
 
 ### 5.3 行为语义边界
 
@@ -189,7 +190,7 @@
 4. `request_id` 必须全局高熵唯一（至少在 session 内唯一），重试时复用同一个 `request_id`。
 5. 业务落库必须使用 fencing token 进行比较（例如 `WHERE fence < newFence`）。
 6. `LocalTTL` 应小于服务端 lease（或使用默认推导），确保客户端先失效。
-7. 生产环境应通过内网、mTLS 或网关鉴权保护服务端接口。
+7. 生产环境至少启用 `LOCK_SERVER_AUTH_TOKEN`，并建议配合 mTLS 或网关鉴权。
 
 ## 7. 参数建议
 
@@ -207,6 +208,7 @@
 2. 热点前缀（同一 `L1` 不同 `L2`）混合流量。
 3. 心跳抖动（延迟突增、超时、短时 5xx）。
 4. 服务重启 + 客户端重连风暴。
+5. 限流边界（RPS/Burst）与拒绝率曲线。
 
 ### 8.2 故障演练
 
@@ -216,7 +218,7 @@
 
 ## 9. 后续演进方向
 
-1. 引入可持久化的 fence epoch（或把 server epoch 纳入 fence 语义）。
+1. 引入可持久化的 fence epoch（或把 `server_id` 纳入 fence 语义）。
 2. 增加观测面：Prometheus 指标、结构化日志、trace。
 3. 支持多实例时引入一致性存储（etcd/raft）或明确网关粘性与单主约束。
 4. 客户端提供显式 `Shutdown`/`Close` 语义文档与 lint 规则，降低资源泄漏误用概率。

@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/puper/klock/pkg/hierlock"
+	"google.golang.org/grpc/metadata"
 )
 
 func TestIdempotentAcquireByRequestID(t *testing.T) {
@@ -322,5 +324,111 @@ func TestNextLockTokenUsesRandomHexFormat(t *testing.T) {
 	re := regexp.MustCompile(`^lk_[0-9a-f]{32}$`)
 	if !re.MatchString(tok1) || !re.MatchString(tok2) {
 		t.Fatalf("unexpected token format: tok1=%q tok2=%q", tok1, tok2)
+	}
+}
+
+func TestDrainForRestartNotifiesWatchers(t *testing.T) {
+	svc := newLockService(hierlock.MustNew(16), time.Second, 5*time.Second, "srv-test")
+	sess, err := svc.createSession(createSessionRequest{})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	ch, watcherID, err := svc.registerWatcher(sess.SessionID)
+	if err != nil {
+		t.Fatalf("register watcher: %v", err)
+	}
+	defer svc.unregisterWatcher(sess.SessionID, watcherID)
+
+	svc.drainForRestart()
+
+	select {
+	case ev, ok := <-ch:
+		if !ok {
+			t.Fatal("watcher channel closed without invalidation event")
+		}
+		if ev.Type != "SESSION_INVALIDATED" {
+			t.Fatalf("unexpected event type: %s", ev.Type)
+		}
+		if ev.Code != "SESSION_GONE" {
+			t.Fatalf("unexpected event code: %s", ev.Code)
+		}
+		if !strings.Contains(ev.Message, "server_restarting") {
+			t.Fatalf("unexpected event message: %s", ev.Message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for restart invalidation event")
+	}
+}
+
+func TestCreateSessionRejectedWhileDraining(t *testing.T) {
+	svc := newLockService(hierlock.MustNew(16), time.Second, 5*time.Second, "srv-test")
+	svc.drainForRestart()
+
+	_, err := svc.createSession(createSessionRequest{})
+	var ae *apiError
+	if !errors.As(err, &ae) {
+		t.Fatalf("expected apiError, got: %v", err)
+	}
+	if ae.code != "SERVER_DRAINING" {
+		t.Fatalf("expected SERVER_DRAINING, got: %s", ae.code)
+	}
+}
+
+func TestRegisterWatcherRejectedWhileDraining(t *testing.T) {
+	svc := newLockService(hierlock.MustNew(16), time.Second, 5*time.Second, "srv-test")
+	sess, err := svc.createSession(createSessionRequest{})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	svc.drainForRestart()
+
+	_, _, err = svc.registerWatcher(sess.SessionID)
+	var ae *apiError
+	if !errors.As(err, &ae) {
+		t.Fatalf("expected apiError, got: %v", err)
+	}
+	if ae.code != "SERVER_DRAINING" {
+		t.Fatalf("expected SERVER_DRAINING, got: %s", ae.code)
+	}
+}
+
+func TestAuthTokenFromContextBearer(t *testing.T) {
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer token-123"))
+	got := authTokenFromContext(ctx)
+	if got != "token-123" {
+		t.Fatalf("unexpected token: %q", got)
+	}
+}
+
+func TestAuthTokenFromContextRaw(t *testing.T) {
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "token-raw"))
+	got := authTokenFromContext(ctx)
+	if got != "token-raw" {
+		t.Fatalf("unexpected token: %q", got)
+	}
+}
+
+func TestSubtleConstantTimeMatch(t *testing.T) {
+	if !subtleConstantTimeMatch("abc", "abc") {
+		t.Fatal("expected equal tokens to match")
+	}
+	if subtleConstantTimeMatch("abc", "abd") {
+		t.Fatal("expected different tokens not to match")
+	}
+}
+
+func TestRateLimiterAllowAndRefill(t *testing.T) {
+	rl := newRateLimiter(1, 1)
+	now := time.Now()
+	key := "/klock.v1.LockService/Acquire|127.0.0.1:1"
+	if !rl.allow(key, now) {
+		t.Fatal("expected first request allowed")
+	}
+	if rl.allow(key, now) {
+		t.Fatal("expected second request denied due to burst limit")
+	}
+	if !rl.allow(key, now.Add(1100*time.Millisecond)) {
+		t.Fatal("expected token refill after 1s")
 	}
 }
