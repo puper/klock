@@ -9,6 +9,7 @@ import (
 )
 
 func TestLockPrefixBlocksLockKey(t *testing.T) {
+	// 验证：持有 L1 锁时，同前缀下 L2 申请会被阻塞直到超时。
 	l := MustNew(16)
 	ctx := context.Background()
 
@@ -28,6 +29,7 @@ func TestLockPrefixBlocksLockKey(t *testing.T) {
 }
 
 func TestLockKeyMutualExclusionOnSameKey(t *testing.T) {
+	// 验证：同一 (p1,p2) 必须互斥。
 	l := MustNew(16)
 	ctx := context.Background()
 
@@ -72,6 +74,7 @@ func TestLockKeyMutualExclusionOnSameKey(t *testing.T) {
 }
 
 func TestLockKeyDifferentKeysCanProceed(t *testing.T) {
+	// 验证：同一 p1 下不同 p2 可以并行。
 	l := MustNew(16)
 	ctx := context.Background()
 
@@ -100,6 +103,7 @@ func TestLockKeyDifferentKeysCanProceed(t *testing.T) {
 }
 
 func TestTimeoutRollbackAndReclaim(t *testing.T) {
+	// 验证：超时失败路径会正确回滚并回收节点，不残留引用。
 	l := MustNew(16)
 	ctx := context.Background()
 
@@ -133,6 +137,7 @@ func TestTimeoutRollbackAndReclaim(t *testing.T) {
 }
 
 func TestUnlockIsIdempotent(t *testing.T) {
+	// 验证：unlock 幂等，多次调用只生效一次。
 	l := MustNew(1)
 	ctx := context.Background()
 
@@ -160,6 +165,7 @@ func TestUnlockIsIdempotent(t *testing.T) {
 }
 
 func TestPendingWriterBlocksNewReaders(t *testing.T) {
+	// 验证：有 L1 写者等待时，新 L2 读者会被门控阻塞。
 	l := MustNew(16)
 	ctx := context.Background()
 

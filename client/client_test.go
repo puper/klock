@@ -11,6 +11,7 @@ import (
 )
 
 func TestLockHandleUnlockAndDone(t *testing.T) {
+	// 验证：解锁成功后 Done 会收到 unlocked 事件。
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(headerServerID, "srv-a")
 		w.Header().Set(headerProtocol, protocolVersion)
@@ -77,6 +78,7 @@ func TestLockHandleUnlockAndDone(t *testing.T) {
 }
 
 func TestPassiveSessionGoneNotifiesHandle(t *testing.T) {
+	// 验证：服务端返回 SESSION_GONE 时，句柄会收到被动失效事件。
 	var (
 		mu      sync.Mutex
 		expired bool
@@ -153,6 +155,7 @@ func TestPassiveSessionGoneNotifiesHandle(t *testing.T) {
 }
 
 func TestHeartbeatTwoFailuresInvalidateLocks(t *testing.T) {
+	// 验证：heartbeat 连续失败达到阈值后触发 fail-closed。
 	var (
 		mu           sync.Mutex
 		heartbeatHit int
@@ -224,6 +227,7 @@ func TestHeartbeatTwoFailuresInvalidateLocks(t *testing.T) {
 }
 
 func TestAutoRenewLocalTTLOnHeartbeatSuccess(t *testing.T) {
+	// 验证：自动续约句柄会在 heartbeat 成功后刷新本地 TTL。
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(headerServerID, "srv-a")
 		w.Header().Set(headerProtocol, protocolVersion)
@@ -283,6 +287,7 @@ func TestAutoRenewLocalTTLOnHeartbeatSuccess(t *testing.T) {
 }
 
 func TestHeartbeatFailureDoesNotStopLocalExpiryLoopAfterSessionReinit(t *testing.T) {
+	// 验证：heartbeat 失败导致 session 失效后，重建 session 仍保持本地 TTL 扫描可用。
 	var (
 		mu             sync.Mutex
 		sessionCreates int
@@ -380,5 +385,20 @@ func TestHeartbeatFailureDoesNotStopLocalExpiryLoopAfterSessionReinit(t *testing
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("expected second handle to expire locally")
+	}
+}
+
+func TestClosePreventsNewLockAcquisition(t *testing.T) {
+	// 验证：Close 后客户端不可复用，新加锁请求会被拒绝。
+	c := NewWithConfig("http://127.0.0.1:65535", nil, Config{
+		HeartbeatInterval: 20 * time.Millisecond,
+	})
+	if err := c.Close(context.Background()); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	_, err := c.Lock(context.Background(), "tenant-1", "res-1", LockOption{})
+	if err == nil || err.Error() != "client is closed" {
+		t.Fatalf("expected closed client error, got: %v", err)
 	}
 }

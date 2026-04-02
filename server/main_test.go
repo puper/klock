@@ -3,13 +3,15 @@ package main
 import (
 	"context"
 	"errors"
+	"regexp"
 	"testing"
 	"time"
 
-	"klock/pkg/hierlock"
+	"github.com/puper/klock/pkg/hierlock"
 )
 
 func TestIdempotentAcquireByRequestID(t *testing.T) {
+	// 验证：同一 request_id 的 acquire 返回同一 token/fence（幂等）。
 	svc := newLockService(hierlock.MustNew(16), 200*time.Millisecond, time.Second, "srv-test")
 	sess, err := svc.createSession(createSessionRequest{})
 	if err != nil {
@@ -31,6 +33,7 @@ func TestIdempotentAcquireByRequestID(t *testing.T) {
 }
 
 func TestFencingTokenMonotonic(t *testing.T) {
+	// 验证：fence 单调递增。
 	svc := newLockService(hierlock.MustNew(16), time.Second, 5*time.Second, "srv-test")
 	sess, err := svc.createSession(createSessionRequest{})
 	if err != nil {
@@ -55,6 +58,7 @@ func TestFencingTokenMonotonic(t *testing.T) {
 }
 
 func TestSessionExpiryReleasesLocks(t *testing.T) {
+	// 验证：session 过期后，关联锁会被回收。
 	svc := newLockService(hierlock.MustNew(16), 40*time.Millisecond, time.Second, "srv-test")
 	sess, err := svc.createSession(createSessionRequest{LeaseMS: 40})
 	if err != nil {
@@ -85,6 +89,7 @@ func TestSessionExpiryReleasesLocks(t *testing.T) {
 }
 
 func TestHeartbeatKeepsSessionAlive(t *testing.T) {
+	// 验证：heartbeat 成功可延长会话存活。
 	svc := newLockService(hierlock.MustNew(16), 50*time.Millisecond, time.Second, "srv-test")
 	sess, err := svc.createSession(createSessionRequest{LeaseMS: 50})
 	if err != nil {
@@ -109,6 +114,7 @@ func TestHeartbeatKeepsSessionAlive(t *testing.T) {
 }
 
 func TestReleaseIdempotencyConflictsOnDifferentToken(t *testing.T) {
+	// 验证：同 request_id 释放不同 token 会触发幂等冲突。
 	svc := newLockService(hierlock.MustNew(16), time.Second, 5*time.Second, "srv-test")
 	sess, err := svc.createSession(createSessionRequest{})
 	if err != nil {
@@ -147,6 +153,7 @@ func TestReleaseIdempotencyConflictsOnDifferentToken(t *testing.T) {
 }
 
 func TestVeryShortLeaseSessionStillExpires(t *testing.T) {
+	// 验证：极短 lease 仍能正确过期（覆盖定时器竞态回归）。
 	svc := newLockService(hierlock.MustNew(16), 2*time.Millisecond, time.Second, "srv-test")
 	sess, err := svc.createSession(createSessionRequest{LeaseMS: 2})
 	if err != nil {
@@ -163,6 +170,7 @@ func TestVeryShortLeaseSessionStillExpires(t *testing.T) {
 }
 
 func TestHeartbeatExtendsLeaseWithoutSpuriousExpiry(t *testing.T) {
+	// 验证：续约后不会被旧 timer 回调误过期。
 	svc := newLockService(hierlock.MustNew(16), 20*time.Millisecond, time.Second, "srv-test")
 	sess, err := svc.createSession(createSessionRequest{LeaseMS: 20})
 	if err != nil {
@@ -182,6 +190,7 @@ func TestHeartbeatExtendsLeaseWithoutSpuriousExpiry(t *testing.T) {
 }
 
 func TestAcquireIdempotencyUsesBoundedEviction(t *testing.T) {
+	// 验证：acquire 幂等缓存为有界最旧淘汰。
 	svc := newLockService(hierlock.MustNew(16), time.Second, 5*time.Second, "srv-test")
 	svc.maxIdempotencyEntries = 2
 	sess, err := svc.createSession(createSessionRequest{})
@@ -244,6 +253,7 @@ func TestAcquireIdempotencyUsesBoundedEviction(t *testing.T) {
 }
 
 func TestReleaseIdempotencyUsesBoundedEviction(t *testing.T) {
+	// 验证：release 幂等缓存为有界最旧淘汰。
 	svc := newLockService(hierlock.MustNew(16), time.Second, 5*time.Second, "srv-test")
 	svc.maxIdempotencyEntries = 2
 	sess, err := svc.createSession(createSessionRequest{})
@@ -297,5 +307,20 @@ func TestReleaseIdempotencyUsesBoundedEviction(t *testing.T) {
 	var ae *apiError
 	if !errors.As(err, &ae) || ae.code != "LOCK_NOT_FOUND" {
 		t.Fatalf("expected evicted idempotency key to behave as fresh request, got: %v", err)
+	}
+}
+
+func TestNextLockTokenUsesRandomHexFormat(t *testing.T) {
+	// 验证：锁 token 使用随机十六进制格式，且相邻 token 不重复。
+	svc := newLockService(hierlock.MustNew(16), time.Second, 5*time.Second, "srv-test")
+
+	tok1 := svc.nextLockToken()
+	tok2 := svc.nextLockToken()
+	if tok1 == tok2 {
+		t.Fatalf("expected distinct lock tokens, got duplicated token %q", tok1)
+	}
+	re := regexp.MustCompile(`^lk_[0-9a-f]{32}$`)
+	if !re.MatchString(tok1) || !re.MatchString(tok2) {
+		t.Fatalf("unexpected token format: tok1=%q tok2=%q", tok1, tok2)
 	}
 }

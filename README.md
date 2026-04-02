@@ -8,7 +8,7 @@
 
 当前实现重点是安全优先：客户端先失效、服务端后回收。
 
-`client.Client` 含后台 goroutine（heartbeat/local sweep），业务侧使用完需要调用 `Close(ctx)` 回收资源。
+`client.Client` 含后台 goroutine（heartbeat/local sweep），业务侧使用完需要调用 `Close(ctx)` 回收资源。`Close(ctx)` 后该实例不可复用。
 
 ## 功能概览
 
@@ -27,10 +27,13 @@
 ```text
 .
 ├── client/              # Go SDK
+├── docs/                # 设计与场景分析文档
 ├── pkg/hierlock/        # 进程内层级锁
 ├── server/              # HTTP 锁服务
 └── go.mod
 ```
+
+详细设计与逐场景分析见：[docs/design-scenarios.md](docs/design-scenarios.md)。
 
 ## 快速开始
 
@@ -57,20 +60,45 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
 	"time"
 
-	"klock/client"
+	"github.com/puper/klock/client"
 )
 
 func main() {
-	c := client.NewWithConfig("http://127.0.0.1:8080", nil, client.Config{
-		HeartbeatInterval: 1 * time.Second,
-		HeartbeatTimeout:  2 * time.Second,
-		LocalTTL:          2 * time.Second, // client 本地锁有效期
-		ServerLeaseBuffer: 3 * time.Second, // server 相对 client 的固定 buffer
-	})
+	httpClient := &http.Client{
+		Timeout: 3 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100,
+			IdleConnTimeout:     90 * time.Second,
+			DialContext: (&net.Dialer{
+				Timeout: 1 * time.Second,
+			}).DialContext,
+		},
+	}
 
-	h, err := c.Lock(context.Background(), "tenant-1", "res-1", client.LockOption{})
+	c := client.NewWithConfig("http://127.0.0.1:8080", httpClient, client.Config{
+		SessionLease:      8 * time.Second,
+		HeartbeatInterval: 1 * time.Second,
+		HeartbeatTimeout:  1500 * time.Millisecond,
+		LocalTTL:          3 * time.Second,
+		ServerLeaseBuffer: 5 * time.Second,
+	})
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = c.Close(closeCtx)
+	}()
+
+	lockCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	h, err := c.Lock(lockCtx, "tenant-1", "res-1", client.LockOption{
+		Timeout: 1200 * time.Millisecond,
+	})
 	if err != nil {
 		panic(err)
 	}
@@ -82,7 +110,9 @@ func main() {
 	case <-time.After(500 * time.Millisecond):
 	}
 
-	if err := h.Unlock(context.Background()); err != nil {
+	unlockCtx, unlockCancel := context.WithTimeout(context.Background(), time.Second)
+	defer unlockCancel()
+	if err := h.Unlock(unlockCtx); err != nil {
 		panic(err)
 	}
 }

@@ -17,13 +17,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"klock/pkg/hierlock"
+	"github.com/puper/klock/pkg/hierlock"
 )
 
+// lockScope 表示锁粒度：L1（前缀级）或 L2（资源级）。
 type lockScope string
 
 const (
+	// scopeL1 表示锁定一级键。
 	scopeL1 lockScope = "l1"
+	// scopeL2 表示锁定二级键。
 	scopeL2 lockScope = "l2"
 
 	protocolVersion      = "1"
@@ -37,10 +40,12 @@ const (
 	maxExpiredSessions    = 10000
 )
 
+// createSessionRequest 是创建会话的请求体。
 type createSessionRequest struct {
 	LeaseMS int64 `json:"lease_ms,omitempty"`
 }
 
+// sessionResponse 是会话接口返回体。
 type sessionResponse struct {
 	SessionID       string `json:"session_id"`
 	LeaseMS         int64  `json:"lease_ms"`
@@ -49,6 +54,7 @@ type sessionResponse struct {
 	ProtocolVersion string `json:"protocol_version"`
 }
 
+// lockRequest 是加锁请求体。
 type lockRequest struct {
 	Scope     lockScope `json:"scope"`
 	P1        string    `json:"p1"`
@@ -58,6 +64,7 @@ type lockRequest struct {
 	RequestID string    `json:"request_id"`
 }
 
+// lockResponse 是加锁成功返回体。
 type lockResponse struct {
 	Token           string `json:"token"`
 	Fence           uint64 `json:"fence"`
@@ -69,6 +76,7 @@ type lockResponse struct {
 	ProtocolVersion string `json:"protocol_version"`
 }
 
+// errorResponse 是统一错误返回结构。
 type errorResponse struct {
 	Error           string `json:"error"`
 	Code            string `json:"code,omitempty"`
@@ -76,6 +84,7 @@ type errorResponse struct {
 	ProtocolVersion string `json:"protocol_version"`
 }
 
+// apiError 用于服务内部的结构化错误表达。
 type apiError struct {
 	status int
 	code   string
@@ -84,17 +93,26 @@ type apiError struct {
 
 func (e *apiError) Error() string { return e.msg }
 
+// lockHandle 保存 token 对应的解锁函数。
+// once 用于保证多路径释放时只执行一次 unlock。
 type lockHandle struct {
 	token  string
 	unlock func()
 	once   sync.Once
 }
 
+// expiredInfo 记录会话过期原因及过期时间。
 type expiredInfo struct {
 	reason string
 	at     time.Time
 }
 
+// sessionState 是单个 session 的内存状态。
+//
+// 关键说明：
+// 1. timer + timerSeq 用于租约超时；timerSeq 防止旧回调误操作新租约。
+// 2. acquire/release 的 request_id 缓存用于幂等保障。
+// 3. *_Order 用于最旧淘汰，限制幂等缓存大小。
 type sessionState struct {
 	id string
 
@@ -110,6 +128,7 @@ type sessionState struct {
 	locksByToken     map[string]*lockHandle
 }
 
+// lockService 是 HTTP 接口背后的核心状态机。
 type lockService struct {
 	locker       *hierlock.HierarchicalLocker
 	defaultLease time.Duration
@@ -127,6 +146,7 @@ type lockService struct {
 	maxIdempotencyEntries int
 }
 
+// newLockService 构造服务实例。
 func newLockService(locker *hierlock.HierarchicalLocker, defaultLease, maxLease time.Duration, serverID string) *lockService {
 	return &lockService{
 		locker:          locker,
@@ -140,6 +160,7 @@ func newLockService(locker *hierlock.HierarchicalLocker, defaultLease, maxLease 
 	}
 }
 
+// createSession 创建会话并初始化 lease 定时器。
 func (s *lockService) createSession(req createSessionRequest) (sessionResponse, error) {
 	lease := s.defaultLease
 	if req.LeaseMS > 0 {
@@ -182,6 +203,7 @@ func (s *lockService) createSession(req createSessionRequest) (sessionResponse, 
 	}, nil
 }
 
+// heartbeat 为指定 session 续约。
 func (s *lockService) heartbeat(sessionID string) (sessionResponse, error) {
 	s.mu.Lock()
 	st, ok := s.sessions[sessionID]
@@ -206,10 +228,12 @@ func (s *lockService) heartbeat(sessionID string) (sessionResponse, error) {
 	return resp, nil
 }
 
+// closeSession 执行客户端主动关闭会话流程。
 func (s *lockService) closeSession(sessionID string) bool {
 	return s.expireSession(sessionID, "client_close")
 }
 
+// acquire 执行完整加锁流程：校验 -> 幂等 -> 真正加锁 -> 状态登记。
 func (s *lockService) acquire(ctx context.Context, req lockRequest) (lockResponse, error) {
 	if req.SessionID == "" {
 		return lockResponse{}, errors.New("session_id is required")
@@ -304,6 +328,7 @@ func (s *lockService) acquire(ctx context.Context, req lockRequest) (lockRespons
 	return resp, nil
 }
 
+// release 释放 token 对应锁，支持 request_id 幂等语义。
 func (s *lockService) release(sessionID, token, requestID string) (bool, error) {
 	if sessionID == "" {
 		return false, errors.New("session_id is required")
@@ -343,6 +368,7 @@ func (s *lockService) release(sessionID, token, requestID string) (bool, error) 
 	return true, nil
 }
 
+// expireSession 使 session 失效并回收该 session 下的全部锁。
 func (s *lockService) expireSession(sessionID, reason string) bool {
 	var handles []*lockHandle
 
@@ -370,6 +396,7 @@ func (s *lockService) expireSession(sessionID, reason string) bool {
 	return true
 }
 
+// expiredReasonLocked 查询会话是否在“最近过期记录”中。
 func (s *lockService) expiredReasonLocked(sessionID string) string {
 	info, ok := s.expiredSessions[sessionID]
 	if !ok {
@@ -382,6 +409,7 @@ func (s *lockService) expiredReasonLocked(sessionID string) string {
 	return info.reason
 }
 
+// pruneExpiredLocked 清理过期历史，避免 expiredSessions 无界增长。
 func (s *lockService) pruneExpiredLocked(now time.Time) {
 	for id, info := range s.expiredSessions {
 		if now.Sub(info.at) > expiredRetention {
@@ -396,10 +424,12 @@ func (s *lockService) pruneExpiredLocked(now time.Time) {
 	}
 }
 
+// safeUnlock 保证 unlock 只执行一次。
 func (h *lockHandle) safeUnlock() {
 	h.once.Do(func() { h.unlock() })
 }
 
+// armSessionTimerLocked 布置（或重置）session 超时计时器。
 func (s *lockService) armSessionTimerLocked(st *sessionState) {
 	st.timerSeq++
 	seq := st.timerSeq
@@ -416,6 +446,8 @@ func (s *lockService) armSessionTimerLocked(st *sessionState) {
 	})
 }
 
+// onSessionTimer 是 session 定时器回调入口。
+// seq 用于确认当前回调是否仍属于最新 lease 代次。
 func (s *lockService) onSessionTimer(sessionID string, seq uint64) {
 	s.mu.Lock()
 	st, ok := s.sessions[sessionID]
@@ -437,6 +469,7 @@ func (s *lockService) onSessionTimer(sessionID string, seq uint64) {
 	s.expireSession(sessionID, "lease_expired")
 }
 
+// putAcquireIdempotentLocked 写入 acquire 幂等缓存并执行有界淘汰。
 func (s *lockService) putAcquireIdempotentLocked(st *sessionState, requestID string, resp lockResponse) {
 	if _, exists := st.acquireByRequest[requestID]; exists {
 		return
@@ -452,6 +485,7 @@ func (s *lockService) putAcquireIdempotentLocked(st *sessionState, requestID str
 	st.acquireOrder = append(st.acquireOrder, requestID)
 }
 
+// putReleaseIdempotentLocked 写入 release 幂等缓存并执行有界淘汰。
 func (s *lockService) putReleaseIdempotentLocked(st *sessionState, requestID, token string) {
 	if _, exists := st.releaseByRequest[requestID]; exists {
 		return
@@ -467,6 +501,7 @@ func (s *lockService) putReleaseIdempotentLocked(st *sessionState, requestID, to
 	st.releaseOrder = append(st.releaseOrder, requestID)
 }
 
+// evictOldestAcquireLocked 淘汰最旧 acquire request_id。
 func (s *lockService) evictOldestAcquireLocked(st *sessionState) {
 	for len(st.acquireOrder) > 0 {
 		oldest := st.acquireOrder[0]
@@ -478,6 +513,7 @@ func (s *lockService) evictOldestAcquireLocked(st *sessionState) {
 	}
 }
 
+// evictOldestReleaseLocked 淘汰最旧 release request_id。
 func (s *lockService) evictOldestReleaseLocked(st *sessionState) {
 	for len(st.releaseOrder) > 0 {
 		oldest := st.releaseOrder[0]
@@ -489,16 +525,25 @@ func (s *lockService) evictOldestReleaseLocked(st *sessionState) {
 	}
 }
 
+// nextSessionID 生成 session 标识。
 func (s *lockService) nextSessionID() string {
 	n := atomic.AddUint64(&s.nextSess, 1)
 	return fmt.Sprintf("sess_%d_%d", time.Now().UnixNano(), n)
 }
 
+// nextLockToken 生成锁 token。
+// 默认使用强随机，随机源异常时回退到时间戳+计数器以保证服务可用。
 func (s *lockService) nextLockToken() string {
-	n := atomic.AddUint64(&s.nextLock, 1)
-	return fmt.Sprintf("lk_%d_%d", time.Now().UnixNano(), n)
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		// Fallback keeps service available if entropy source is temporarily unavailable.
+		n := atomic.AddUint64(&s.nextLock, 1)
+		return fmt.Sprintf("lk_%d_%d", time.Now().UnixNano(), n)
+	}
+	return "lk_" + hex.EncodeToString(buf)
 }
 
+// newHandler 组装 HTTP 路由。
 func newHandler(svc *lockService) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -641,6 +686,7 @@ func newHandler(svc *lockService) http.Handler {
 	return mux
 }
 
+// checkProtocol 校验协议版本。
 func checkProtocol(r *http.Request) error {
 	v := r.Header.Get(headerProtocol)
 	if v == "" || v == protocolVersion {
@@ -649,6 +695,7 @@ func checkProtocol(r *http.Request) error {
 	return &apiError{status: http.StatusConflict, code: "PROTOCOL_MISMATCH", msg: "protocol version mismatch"}
 }
 
+// checkServerID 校验客户端期望的服务实例 ID。
 func checkServerID(r *http.Request, current string) error {
 	expected := r.Header.Get(headerServerID)
 	if expected == "" || expected == current {
@@ -657,6 +704,7 @@ func checkServerID(r *http.Request, current string) error {
 	return &apiError{status: http.StatusConflict, code: "SERVER_INSTANCE_MISMATCH", msg: "server instance changed"}
 }
 
+// writeJSON 写入 JSON 响应并补充协议头。
 func writeJSON(w http.ResponseWriter, svc *lockService, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set(headerServerID, svc.serverID)
@@ -665,10 +713,12 @@ func writeJSON(w http.ResponseWriter, svc *lockService, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// writeError 写结构化错误响应。
 func writeError(w http.ResponseWriter, svc *lockService, status int, code, msg string) {
 	writeJSON(w, svc, status, errorResponse{Error: msg, Code: code, ServerID: svc.serverID, ProtocolVersion: protocolVersion})
 }
 
+// writeAPIError 将内部错误映射为对外可消费的 API 错误。
 func writeAPIError(w http.ResponseWriter, svc *lockService, err error) {
 	var ae *apiError
 	if errors.As(err, &ae) {
@@ -682,6 +732,7 @@ func writeAPIError(w http.ResponseWriter, svc *lockService, err error) {
 	writeError(w, svc, http.StatusBadRequest, "BAD_REQUEST", err.Error())
 }
 
+// newServerID 生成服务实例 ID，用于客户端实例粘性校验。
 func newServerID() string {
 	buf := make([]byte, 8)
 	if _, err := rand.Read(buf); err != nil {
@@ -690,6 +741,7 @@ func newServerID() string {
 	return "srv_" + hex.EncodeToString(buf)
 }
 
+// main 启动 HTTP 锁服务。
 func main() {
 	addr := envOrDefault("LOCK_SERVER_ADDR", ":8080")
 	shardCount := envAsInt("LOCK_SERVER_SHARDS", 1024)
@@ -719,6 +771,7 @@ func main() {
 	}
 }
 
+// envOrDefault 读取字符串环境变量并回退默认值。
 func envOrDefault(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -726,6 +779,7 @@ func envOrDefault(key, fallback string) string {
 	return fallback
 }
 
+// envAsInt 读取整型环境变量并回退默认值。
 func envAsInt(key string, fallback int) int {
 	v := os.Getenv(key)
 	if v == "" {
