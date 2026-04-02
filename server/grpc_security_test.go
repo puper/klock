@@ -37,9 +37,8 @@ func newTestGRPCClient(t *testing.T, authToken string, limiter *rateLimiter) (lo
 	lockrpcpb.RegisterLockServiceServer(s, newGRPCServer(svc))
 	go func() { _ = s.Serve(lis) }()
 
-	conn, err := grpc.DialContext(
-		context.Background(),
-		"bufnet",
+	conn, err := grpc.NewClient(
+		"passthrough:///bufnet",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return lis.Dial() }),
 	)

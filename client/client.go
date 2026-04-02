@@ -262,7 +262,7 @@ func NewWithConfig(baseURL string, cfg Config) *Client {
 		bgDone:  make(chan struct{}),
 	}
 
-	conn, err := grpc.Dial(
+	conn, err := grpc.NewClient(
 		target,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
