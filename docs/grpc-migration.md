@@ -120,9 +120,11 @@
 ## 7. 一致性与安全性
 
 1. `fence` 单调递增语义不变。
-2. `Acquire/Release` 幂等窗口策略不变（有界最旧淘汰）。
+2. `Acquire/Release` 幂等窗口采用容量+TTL 双有界策略。
 3. 对“未知状态”统一按失效处理，避免误持锁。
 4. 协议或版本异常返回明确错误码，不使用隐式行为。
+
+补充：客户端 `Lock` 最终失败且非服务端明确 `LOCK_TIMEOUT` 时，会自动 fail-closed 当前 session（`LOCK_UNCERTAIN_RESULT`）。
 
 ## 8. 推荐错误码（当前实现）
 
@@ -160,6 +162,7 @@
 2. 客户端与服务端均为纯 gRPC
 3. 已具备鉴权（Bearer token）与基础限流
 4. 已提供压测工具 `cmd/loadtest`
+5. 已提供场景化演示工具 `cmd/clientdemo`
 
 后续上线门槛建议：
 

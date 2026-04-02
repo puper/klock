@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
 	"regexp"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/puper/klock/pkg/hierlock"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 )
 
 func TestIdempotentAcquireByRequestID(t *testing.T) {
@@ -430,5 +432,15 @@ func TestRateLimiterAllowAndRefill(t *testing.T) {
 	}
 	if !rl.allow(key, now.Add(1100*time.Millisecond)) {
 		t.Fatal("expected token refill after 1s")
+	}
+}
+
+func TestPeerKeyFromContextUsesHostOnly(t *testing.T) {
+	ctx := peer.NewContext(context.Background(), &peer.Peer{
+		Addr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 43210},
+	})
+	got := peerKeyFromContext(ctx)
+	if got != "127.0.0.1" {
+		t.Fatalf("expected host-only key, got: %q", got)
 	}
 }

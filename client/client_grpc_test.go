@@ -18,9 +18,14 @@ import (
 type fakeLockRPCServer struct {
 	lockrpcpb.UnimplementedLockServiceServer
 
-	mu        sync.Mutex
-	watchers  []chan *lockrpcpb.ServerEvent
-	authToken string
+	mu               sync.Mutex
+	watchers         []chan *lockrpcpb.ServerEvent
+	authToken        string
+	releaseFailFor   int
+	releaseCalls     int
+	releaseRequestID []string
+	failAcquireP2    string
+	failAcquireCode  codes.Code
 }
 
 func (f *fakeLockRPCServer) requireAuth(ctx context.Context) error {
@@ -68,9 +73,16 @@ func (f *fakeLockRPCServer) Heartbeat(ctx context.Context, _ *lockrpcpb.Heartbea
 	}, nil
 }
 
-func (f *fakeLockRPCServer) Acquire(ctx context.Context, _ *lockrpcpb.LockRequest) (*lockrpcpb.LockResponse, error) {
+func (f *fakeLockRPCServer) Acquire(ctx context.Context, req *lockrpcpb.LockRequest) (*lockrpcpb.LockResponse, error) {
 	if err := f.requireAuth(ctx); err != nil {
 		return nil, err
+	}
+	f.mu.Lock()
+	failP2 := f.failAcquireP2
+	failCode := f.failAcquireCode
+	f.mu.Unlock()
+	if failP2 != "" && req.P2 == failP2 {
+		return nil, status.Error(failCode, "simulated acquire failure")
 	}
 	return &lockrpcpb.LockResponse{
 		Token:           "lk-1",
@@ -81,9 +93,18 @@ func (f *fakeLockRPCServer) Acquire(ctx context.Context, _ *lockrpcpb.LockReques
 	}, nil
 }
 
-func (f *fakeLockRPCServer) Release(ctx context.Context, _ *lockrpcpb.ReleaseRequest) (*lockrpcpb.ReleaseResponse, error) {
+func (f *fakeLockRPCServer) Release(ctx context.Context, req *lockrpcpb.ReleaseRequest) (*lockrpcpb.ReleaseResponse, error) {
 	if err := f.requireAuth(ctx); err != nil {
 		return nil, err
+	}
+	f.mu.Lock()
+	f.releaseCalls++
+	call := f.releaseCalls
+	f.releaseRequestID = append(f.releaseRequestID, req.RequestId)
+	failFor := f.releaseFailFor
+	f.mu.Unlock()
+	if call <= failFor {
+		return nil, status.Error(codes.Unavailable, "temporary release failure")
 	}
 	return &lockrpcpb.ReleaseResponse{
 		Ok:              true,
@@ -197,5 +218,116 @@ func TestGRPCWatchInvalidatesLockOnServerRestart(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected lock invalidation event from watch stream")
+	}
+}
+
+func TestUnlockWithRetryUsesSameRequestIDAndEventuallySucceeds(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer lis.Close()
+
+	grpcSrv := grpc.NewServer()
+	fake := &fakeLockRPCServer{
+		authToken:      "test-token",
+		releaseFailFor: 2,
+	}
+	lockrpcpb.RegisterLockServiceServer(grpcSrv, fake)
+	go grpcSrv.Serve(lis)
+	defer grpcSrv.Stop()
+
+	c := NewWithConfig("grpc://"+lis.Addr().String(), Config{
+		SessionLease:      2 * time.Second,
+		HeartbeatInterval: 200 * time.Millisecond,
+		HeartbeatTimeout:  500 * time.Millisecond,
+		LocalTTL:          2 * time.Second,
+		AuthToken:         "test-token",
+	})
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = c.Close(closeCtx)
+	}()
+
+	h, err := c.Lock(context.Background(), "tenant-1", "res-retry", LockOption{})
+	if err != nil {
+		t.Fatalf("lock failed: %v", err)
+	}
+	if err := h.UnlockWithRetry(context.Background(), 4, 10*time.Millisecond); err != nil {
+		t.Fatalf("UnlockWithRetry failed: %v", err)
+	}
+
+	ev := <-h.Done()
+	if ev.Type != EventUnlocked {
+		t.Fatalf("expected unlocked event, got %s", ev.Type)
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.releaseCalls < 3 {
+		t.Fatalf("expected at least 3 release attempts, got %d", fake.releaseCalls)
+	}
+	if len(fake.releaseRequestID) == 0 {
+		t.Fatal("expected release request ids recorded")
+	}
+	first := fake.releaseRequestID[0]
+	for i, rid := range fake.releaseRequestID {
+		if rid != first {
+			t.Fatalf("expected same request_id across retries, idx=%d got=%q want=%q", i, rid, first)
+		}
+	}
+}
+
+func TestLockUncertainFailureTriggersFailClosedSession(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer lis.Close()
+
+	grpcSrv := grpc.NewServer()
+	fake := &fakeLockRPCServer{
+		authToken:       "test-token",
+		failAcquireP2:   "res-uncertain",
+		failAcquireCode: codes.Unavailable,
+	}
+	lockrpcpb.RegisterLockServiceServer(grpcSrv, fake)
+	go grpcSrv.Serve(lis)
+	defer grpcSrv.Stop()
+
+	c := NewWithConfig("grpc://"+lis.Addr().String(), Config{
+		SessionLease:      2 * time.Second,
+		HeartbeatInterval: 200 * time.Millisecond,
+		HeartbeatTimeout:  500 * time.Millisecond,
+		LocalTTL:          2 * time.Second,
+		AuthToken:         "test-token",
+	})
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = c.Close(closeCtx)
+	}()
+
+	h1, err := c.Lock(context.Background(), "tenant-1", "res-hold", LockOption{})
+	if err != nil {
+		t.Fatalf("first lock failed: %v", err)
+	}
+
+	_, err = c.Lock(context.Background(), "tenant-1", "res-uncertain", LockOption{Timeout: 300 * time.Millisecond})
+	if err == nil {
+		t.Fatal("expected uncertain lock failure")
+	}
+
+	select {
+	case ev := <-h1.Done():
+		if ev.Type != EventSessionGone {
+			t.Fatalf("expected session_gone after uncertain lock failure, got %s", ev.Type)
+		}
+		if ev.ErrorCode != "LOCK_UNCERTAIN_RESULT" {
+			t.Fatalf("expected LOCK_UNCERTAIN_RESULT, got %s", ev.ErrorCode)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected held lock to be fail-closed after uncertain lock failure")
 	}
 }

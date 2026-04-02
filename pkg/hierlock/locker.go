@@ -15,9 +15,9 @@ const (
 	// 但会增加一些内存占用。
 	defaultShardCount = 1024
 	// activeSpins 表示进入 sleep 退避前，最多主动让出 CPU 的次数。
-	activeSpins       = 32
+	activeSpins = 32
 	// maxBackoff 是自旋失败后的最大退避时长。
-	maxBackoff        = time.Millisecond
+	maxBackoff = time.Millisecond
 )
 
 // errInvalidShardCount 表示分片数非法。
@@ -32,11 +32,11 @@ type key2 struct {
 // lockNode 是实际的锁节点。
 //
 // 设计说明：
-// 1. mu 为节点锁本体。L1 节点使用 RWMutex：写锁代表 L1 独占，读锁代表 L2 进入门票。
-// 2. refCount 用于生命周期管理；当引用归零后从 shard map 中回收节点。
-// 3. pendingWriters 用于“写者优先门控”：
-//    当 L1 写者在等待时，阻止新的 L1 读者（即新的 L2 请求）继续进入，
-//    以降低写者饥饿概率。
+//  1. mu 为节点锁本体。L1 节点使用 RWMutex：写锁代表 L1 独占，读锁代表 L2 进入门票。
+//  2. refCount 用于生命周期管理；当引用归零后从 shard map 中回收节点。
+//  3. pendingWriters 用于“写者优先门控”：
+//     当 L1 写者在等待时，阻止新的 L1 读者（即新的 L2 请求）继续进入，
+//     以降低写者饥饿概率。
 type lockNode struct {
 	mu       sync.RWMutex
 	refCount int32
@@ -171,16 +171,6 @@ func (h *HierarchicalLocker) Lock(ctx context.Context, p1, p2 string) (func(), e
 		})
 	}
 	return unlock, nil
-}
-
-// LockPrefix is kept for backward compatibility. Prefer LockL1.
-func (h *HierarchicalLocker) LockPrefix(ctx context.Context, p1 string) (func(), error) {
-	return h.LockL1(ctx, p1)
-}
-
-// LockKey is kept for backward compatibility. Prefer Lock.
-func (h *HierarchicalLocker) LockKey(ctx context.Context, p1, p2 string) (func(), error) {
-	return h.Lock(ctx, p1, p2)
 }
 
 // shardFor 根据 p1 计算分片，保证同一 p1 总是落在同一 shard。

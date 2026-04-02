@@ -57,6 +57,8 @@ go run ./server
 5. `LOCK_SERVER_AUTH_TOKEN`（可选，设置后启用 token 鉴权）
 6. `LOCK_SERVER_RATE_LIMIT_RPS`（默认 `200`）
 7. `LOCK_SERVER_RATE_LIMIT_BURST`（默认 `400`）
+8. `LOCK_SERVER_IDEMPOTENCY_ENTRIES`（默认 `65536`）
+9. `LOCK_SERVER_IDEMPOTENCY_TTL_MS`（默认 `3600000`，即 1h）
 
 ### 2) 客户端使用
 
@@ -119,6 +121,7 @@ func main() {
 2. `Fence`：fencing token（单调递增）
 3. `Done() <-chan LockEvent`：锁关闭/失效通知
 4. `Unlock(ctx)`：主动释放
+5. `UnlockWithRetry(ctx, maxAttempts, retryDelay)`：解锁失败自动重试（复用同一 request_id）
 
 `Done()` 可能收到的事件：
 
@@ -143,11 +146,18 @@ func main() {
 1. 客户端本地比服务端更早失效，减少异常写入窗口
 2. 服务端租约兜底，最终回收锁
 
+## 失败策略（Lock）
+
+当 `Lock` 最终失败且原因不是服务端明确的锁冲突超时（`LOCK_TIMEOUT`）时，
+客户端会自动 fail-closed 当前 session（广播 `session_gone`，错误码 `LOCK_UNCERTAIN_RESULT`），
+并异步关闭远端 session，减少“服务端已成功加锁但客户端未确认”导致的挂锁窗口。
+
 ## gRPC 通信
 
 客户端支持 `grpc://host:port` 地址，启用 gRPC unary + `WatchSession` 双向流。
 当服务端优雅重启时，会向会话 watch 流广播 `SESSION_INVALIDATED`，客户端会立刻触发 `Done()` 失效事件。
 服务端默认开启基础限流（可配置），并支持 `authorization: Bearer <token>` 鉴权。
+服务端会定期输出指标日志，其中 `rate_limiter_entries` 表示当前限流分桶数量。
 
 ## 协议生成
 
@@ -160,9 +170,9 @@ func main() {
 
 幂等说明（每个 session）：
 
-1. 维护最近 `4096` 条 `acquire` request id
-2. 维护最近 `4096` 条 `release` request id
-3. 超出窗口后按最旧优先淘汰（不是整表清空）
+1. `acquire/release` 幂等缓存支持容量与 TTL 双限制（可配置）
+2. 默认容量 `65536`，默认 TTL `1h`
+3. 超出容量按最旧优先淘汰，超过 TTL 的请求键会过期
 
 ## 测试
 
@@ -185,6 +195,16 @@ go run ./cmd/loadtest \
   -concurrency 64 \
   -duration 30s \
   -keyspace 2048
+```
+
+客户端演示（场景日志）：
+
+```bash
+LOCK_SERVER_AUTH_TOKEN=demo-token go run ./server
+
+go run ./cmd/clientdemo \
+  -addr grpc://127.0.0.1:8080 \
+  -token demo-token
 ```
 
 ## 适用场景与边界

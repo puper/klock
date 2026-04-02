@@ -14,8 +14,10 @@ import (
 
 	"github.com/puper/klock/pkg/lockrpcpb"
 	"google.golang.org/grpc"
+	gcodes "google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	gstatus "google.golang.org/grpc/status"
 )
 
 // Scope 表示锁粒度。
@@ -158,6 +160,40 @@ func (h *LockHandle) Unlock(ctx context.Context) error {
 	return h.client.unlockHandle(ctx, h)
 }
 
+// UnlockWithRetry 在解锁失败时按固定次数与间隔重试。
+// 注意：重试过程会复用同一个 release request_id，确保服务端幂等语义生效。
+func (h *LockHandle) UnlockWithRetry(ctx context.Context, maxAttempts int, retryDelay time.Duration) error {
+	if h == nil || h.client == nil {
+		return errors.New("nil lock handle")
+	}
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
+	if retryDelay <= 0 {
+		retryDelay = 100 * time.Millisecond
+	}
+
+	releaseReqID := h.client.nextRequestID("rel")
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := h.client.unlockHandleWithRequestID(ctx, h, releaseReqID)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isRetriableUnlockError(err) || attempt == maxAttempts {
+			break
+		}
+		if err := sleepWithContext(ctx, retryDelay); err != nil {
+			return err
+		}
+	}
+	return lastErr
+}
+
 // setExpireAt 设置本地过期时间（原子写）。
 func (h *LockHandle) setExpireAt(t time.Time) {
 	atomic.StoreInt64(&h.expireAt, t.UnixNano())
@@ -274,6 +310,10 @@ func NewWithConfig(baseURL string, cfg Config) *Client {
 	}
 	close(c.bgDone)
 
+	if c.initErr != nil {
+		return c
+	}
+
 	sweepCtx, sweepCancel := context.WithCancel(context.Background())
 	c.sweepStop = sweepCancel
 	c.markBGStart()
@@ -298,6 +338,7 @@ func (c *Client) lockWithScope(ctx context.Context, scope Scope, p1, p2 string, 
 	if c.initErr != nil {
 		return nil, c.initErr
 	}
+	lastSessionID := ""
 	waitCtx := ctx
 	cancel := func() {}
 	if opt.Timeout > 0 {
@@ -308,19 +349,23 @@ func (c *Client) lockWithScope(ctx context.Context, scope Scope, p1, p2 string, 
 
 	for {
 		if err := waitCtx.Err(); err != nil {
+			c.failClosedOnUncertainLockFailure(lastSessionID, err)
 			return nil, err
 		}
 
 		sessionID, err := c.ensureSession(waitCtx)
 		if err != nil {
 			if !isRetriableAcquireError(err) {
+				c.failClosedOnUncertainLockFailure(lastSessionID, err)
 				return nil, err
 			}
 			if err := sleepWithContext(waitCtx, defaultAcquireRetryDelay); err != nil {
+				c.failClosedOnUncertainLockFailure(lastSessionID, err)
 				return nil, err
 			}
 			continue
 		}
+		lastSessionID = sessionID
 
 		attemptTimeout := int64(0)
 		if dl, ok := waitCtx.Deadline(); ok {
@@ -353,12 +398,42 @@ func (c *Client) lockWithScope(ctx context.Context, scope Scope, p1, p2 string, 
 
 		c.handleAPIError(sessionID, err)
 		if !isRetriableAcquireError(err) {
+			c.failClosedOnUncertainLockFailure(sessionID, err)
 			return nil, err
 		}
 		if err := sleepWithContext(waitCtx, defaultAcquireRetryDelay); err != nil {
+			c.failClosedOnUncertainLockFailure(sessionID, err)
 			return nil, err
 		}
 	}
+}
+
+func isServerExplicitlyLockConflict(err error) bool {
+	var ae *APIError
+	return errors.As(err, &ae) && ae.Code == "LOCK_TIMEOUT"
+}
+
+func (c *Client) failClosedOnUncertainLockFailure(sessionID string, cause error) {
+	if sessionID == "" || isServerExplicitlyLockConflict(cause) {
+		return
+	}
+	c.invalidateSession(sessionID)
+	msg := "lock failed with uncertain result; session invalidated"
+	if cause != nil {
+		msg += ": " + cause.Error()
+	}
+	c.broadcastSessionEvent(sessionID, LockEvent{
+		Type:       EventSessionGone,
+		Message:    msg,
+		SessionID:  sessionID,
+		ErrorCode:  "LOCK_UNCERTAIN_RESULT",
+		OccurredAt: time.Now(),
+	})
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = c.closeSessionRemote(ctx, sessionID)
+	}()
 }
 
 // isRetriableAcquireError 判断是否应继续重试加锁。
@@ -368,6 +443,14 @@ func isRetriableAcquireError(err error) bool {
 	}
 	if errors.Is(err, context.Canceled) {
 		return false
+	}
+	if st, ok := gstatus.FromError(err); ok {
+		switch st.Code() {
+		case gcodes.Unavailable, gcodes.DeadlineExceeded, gcodes.ResourceExhausted:
+			return true
+		case gcodes.Unauthenticated, gcodes.PermissionDenied, gcodes.InvalidArgument, gcodes.NotFound:
+			return false
+		}
 	}
 
 	var ae *APIError
@@ -431,6 +514,10 @@ func (c *Client) newHandle(resp lockResponse, opt LockOption) *LockHandle {
 // unlockHandle 执行解锁请求并更新本地句柄状态。
 func (c *Client) unlockHandle(ctx context.Context, h *LockHandle) error {
 	releaseReqID := c.nextRequestID("rel")
+	return c.unlockHandleWithRequestID(ctx, h, releaseReqID)
+}
+
+func (c *Client) unlockHandleWithRequestID(ctx context.Context, h *LockHandle, releaseReqID string) error {
 	resp, err := c.grpc.Release(c.rpcContext(ctx), &lockrpcpb.ReleaseRequest{
 		SessionId:       h.sessionID,
 		Token:           h.Token,
@@ -456,6 +543,50 @@ func (c *Client) unlockHandle(ctx context.Context, h *LockHandle) error {
 	return nil
 }
 
+func isRetriableUnlockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if st, ok := gstatus.FromError(err); ok {
+		switch st.Code() {
+		case gcodes.Unavailable, gcodes.DeadlineExceeded, gcodes.ResourceExhausted:
+			return true
+		case gcodes.Unauthenticated, gcodes.PermissionDenied, gcodes.InvalidArgument, gcodes.NotFound:
+			return false
+		}
+	}
+
+	var ae *APIError
+	if errors.As(err, &ae) {
+		switch ae.Code {
+		case "LOCK_TIMEOUT":
+			return true
+		case "SESSION_GONE", "SESSION_NOT_FOUND", "LOCK_NOT_FOUND", "IDEMPOTENCY_CONFLICT":
+			return false
+		}
+		if ae.Status >= 500 {
+			return true
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return true
+	}
+
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return true
+	}
+	return false
+}
+
 // Close 关闭客户端：
 // 1. 标记 closed，阻止后续新加锁；
 // 2. 取消 heartbeat/sweep 后台协程并等待退出；
@@ -468,6 +599,7 @@ func (c *Client) Close(ctx context.Context) error {
 	wStop := c.watchStop
 	sweepStop := c.sweepStop
 	bgDone := c.bgDone
+	conn := c.conn
 	c.sessionID = ""
 	c.heartbeatStop = nil
 	c.watchStop = nil
@@ -496,19 +628,19 @@ func (c *Client) Close(ctx context.Context) error {
 		sweepStop()
 	}
 	if err := waitChannelWithContext(ctx, bgDone); err != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
 		return err
 	}
-	if sessionID == "" {
-		if c.conn != nil {
-			_ = c.conn.Close()
-		}
-		return nil
+	var closeErr error
+	if sessionID != "" {
+		closeErr = c.closeSessionRemote(ctx, sessionID)
 	}
-	err := c.closeSessionRemote(ctx, sessionID)
-	if c.conn != nil {
-		_ = c.conn.Close()
+	if conn != nil {
+		_ = conn.Close()
 	}
-	return err
+	return closeErr
 }
 
 // ensureSession 确保客户端有可用 session。
@@ -655,12 +787,14 @@ func (c *Client) watchLoop(ctx context.Context, sessionID string) {
 			SessionId:       sessionID,
 			ProtocolVersion: protocolVersion,
 		}); err != nil {
+			_ = stream.CloseSend()
 			c.failSessionOnWatch(sessionID, err)
 			return
 		}
 		for {
 			ev, err := stream.Recv()
 			if err != nil {
+				_ = stream.CloseSend()
 				if ctx.Err() != nil {
 					return
 				}
@@ -672,6 +806,7 @@ func (c *Client) watchLoop(ctx context.Context, sessionID string) {
 					c.observeServer(ev.ServerId)
 				}
 			case "SESSION_INVALIDATED":
+				_ = stream.CloseSend()
 				c.invalidateSession(sessionID)
 				c.broadcastSessionEvent(sessionID, LockEvent{
 					Type:       EventSessionGone,
@@ -682,6 +817,7 @@ func (c *Client) watchLoop(ctx context.Context, sessionID string) {
 				})
 				return
 			case "PROTOCOL_MISMATCH":
+				_ = stream.CloseSend()
 				c.broadcastEvent(LockEvent{
 					Type:       EventProtocolMismatch,
 					Message:    ev.Message,

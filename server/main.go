@@ -20,6 +20,7 @@ import (
 
 	"github.com/puper/klock/pkg/hierlock"
 	"github.com/puper/klock/pkg/lockrpcpb"
+	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -40,6 +41,7 @@ const (
 	errorCodeSessionGone = "SESSION_GONE"
 
 	maxIdempotencyEntries = 4096
+	defaultIdempotencyTTL = time.Hour
 	expiredRetention      = 10 * time.Minute
 	maxExpiredSessions    = 10000
 
@@ -121,8 +123,10 @@ type sessionState struct {
 	timerSeq  uint64
 
 	acquireByRequest map[string]lockResponse
+	acquireAt        map[string]time.Time
 	acquireOrder     []string
 	releaseByRequest map[string]string
+	releaseAt        map[string]time.Time
 	releaseOrder     []string
 	locksByToken     map[string]*lockHandle
 	watchers         map[uint64]chan *lockrpcpb.ServerEvent
@@ -144,6 +148,7 @@ type lockService struct {
 	expiredSessions map[string]expiredInfo
 
 	maxIdempotencyEntries int
+	idempotencyTTL        time.Duration
 	nextWatcherID         uint64
 	draining              bool
 	metrics               *serverMetrics
@@ -160,64 +165,16 @@ type serverMetrics struct {
 	rateLimited         atomic.Int64
 }
 
-type tokenBucket struct {
-	mu       sync.Mutex
-	tokens   float64
-	last     time.Time
-	rate     float64
-	burst    float64
-	inactive time.Time
-}
-
-func newTokenBucket(rps, burst int) *tokenBucket {
-	rate := float64(rps)
-	if rate <= 0 {
-		rate = 1
-	}
-	b := float64(burst)
-	if b <= 0 {
-		b = rate
-	}
-	now := time.Now()
-	return &tokenBucket{
-		tokens:   b,
-		last:     now,
-		rate:     rate,
-		burst:    b,
-		inactive: now,
-	}
-}
-
-func (b *tokenBucket) allow(now time.Time) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	delta := now.Sub(b.last).Seconds()
-	if delta > 0 {
-		b.tokens += delta * b.rate
-		if b.tokens > b.burst {
-			b.tokens = b.burst
-		}
-	}
-	b.last = now
-	b.inactive = now
-	if b.tokens < 1 {
-		return false
-	}
-	b.tokens -= 1
-	return true
-}
-
-func (b *tokenBucket) idleFor(now time.Time) time.Duration {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return now.Sub(b.inactive)
+type rateEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
 }
 
 type rateLimiter struct {
 	mu          sync.Mutex
-	limitRPS    int
+	limitRPS    rate.Limit
 	burst       int
-	entries     map[string]*tokenBucket
+	entries     map[string]*rateEntry
 	lastCleanup time.Time
 }
 
@@ -229,19 +186,24 @@ func newRateLimiter(limitRPS, burst int) *rateLimiter {
 		burst = limitRPS * 2
 	}
 	return &rateLimiter{
-		limitRPS:    limitRPS,
+		limitRPS:    rate.Limit(limitRPS),
 		burst:       burst,
-		entries:     make(map[string]*tokenBucket),
+		entries:     make(map[string]*rateEntry),
 		lastCleanup: time.Now(),
 	}
 }
 
 func (r *rateLimiter) allow(key string, now time.Time) bool {
 	r.mu.Lock()
-	b, ok := r.entries[key]
+	entry, ok := r.entries[key]
 	if !ok {
-		b = newTokenBucket(r.limitRPS, r.burst)
-		r.entries[key] = b
+		entry = &rateEntry{
+			limiter:  rate.NewLimiter(r.limitRPS, r.burst),
+			lastSeen: now,
+		}
+		r.entries[key] = entry
+	} else {
+		entry.lastSeen = now
 	}
 	shouldCleanup := now.Sub(r.lastCleanup) > time.Minute
 	if shouldCleanup {
@@ -249,7 +211,7 @@ func (r *rateLimiter) allow(key string, now time.Time) bool {
 	}
 	r.mu.Unlock()
 
-	allowed := b.allow(now)
+	allowed := entry.limiter.AllowN(now, 1)
 
 	if shouldCleanup {
 		r.cleanup(now)
@@ -260,11 +222,17 @@ func (r *rateLimiter) allow(key string, now time.Time) bool {
 func (r *rateLimiter) cleanup(now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for key, b := range r.entries {
-		if b.idleFor(now) > 2*time.Minute {
+	for key, entry := range r.entries {
+		if now.Sub(entry.lastSeen) > 2*time.Minute {
 			delete(r.entries, key)
 		}
 	}
+}
+
+func (r *rateLimiter) size() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.entries)
 }
 
 // newLockService 构造服务实例。
@@ -278,6 +246,7 @@ func newLockService(locker *hierlock.HierarchicalLocker, defaultLease, maxLease 
 		tokens:                make(map[string]*lockHandle),
 		expiredSessions:       make(map[string]expiredInfo),
 		maxIdempotencyEntries: maxIdempotencyEntries,
+		idempotencyTTL:        defaultIdempotencyTTL,
 	}
 }
 
@@ -301,8 +270,10 @@ func (s *lockService) createSession(req createSessionRequest) (sessionResponse, 
 		lease:            lease,
 		expiresAt:        now.Add(lease),
 		acquireByRequest: make(map[string]lockResponse),
+		acquireAt:        make(map[string]time.Time),
 		acquireOrder:     make([]string, 0, 64),
 		releaseByRequest: make(map[string]string),
+		releaseAt:        make(map[string]time.Time),
 		releaseOrder:     make([]string, 0, 64),
 		locksByToken:     make(map[string]*lockHandle),
 		watchers:         make(map[uint64]chan *lockrpcpb.ServerEvent),
@@ -385,7 +356,7 @@ func (s *lockService) acquire(ctx context.Context, req lockRequest) (lockRespons
 		}
 		return lockResponse{}, &apiError{status: http.StatusNotFound, code: "SESSION_NOT_FOUND", msg: "session not found"}
 	}
-	if cached, ok := st.acquireByRequest[req.RequestID]; ok {
+	if cached, ok := s.getAcquireIdempotentLocked(st, req.RequestID, time.Now()); ok {
 		s.mu.Unlock()
 		return cached, nil
 	}
@@ -445,7 +416,7 @@ func (s *lockService) acquire(ctx context.Context, req lockRequest) (lockRespons
 		}
 		return lockResponse{}, &apiError{status: http.StatusNotFound, code: "SESSION_NOT_FOUND", msg: "session not found"}
 	}
-	if cached, ok := st.acquireByRequest[req.RequestID]; ok {
+	if cached, ok := s.getAcquireIdempotentLocked(st, req.RequestID, time.Now()); ok {
 		s.mu.Unlock()
 		h.safeUnlock()
 		return cached, nil
@@ -477,7 +448,7 @@ func (s *lockService) release(sessionID, token, requestID string) (bool, error) 
 		}
 		return false, &apiError{status: http.StatusNotFound, code: "SESSION_NOT_FOUND", msg: "session not found"}
 	}
-	if prevToken, ok := st.releaseByRequest[requestID]; ok {
+	if prevToken, ok := s.getReleaseIdempotentLocked(st, requestID, time.Now()); ok {
 		s.mu.Unlock()
 		if prevToken == token {
 			return true, nil
@@ -696,6 +667,7 @@ func (s *lockService) putAcquireIdempotentLocked(st *sessionState, requestID str
 		s.evictOldestAcquireLocked(st)
 	}
 	st.acquireByRequest[requestID] = resp
+	st.acquireAt[requestID] = time.Now()
 	st.acquireOrder = append(st.acquireOrder, requestID)
 }
 
@@ -712,7 +684,40 @@ func (s *lockService) putReleaseIdempotentLocked(st *sessionState, requestID, to
 		s.evictOldestReleaseLocked(st)
 	}
 	st.releaseByRequest[requestID] = token
+	st.releaseAt[requestID] = time.Now()
 	st.releaseOrder = append(st.releaseOrder, requestID)
+}
+
+func (s *lockService) getAcquireIdempotentLocked(st *sessionState, requestID string, now time.Time) (lockResponse, bool) {
+	resp, ok := st.acquireByRequest[requestID]
+	if !ok {
+		return lockResponse{}, false
+	}
+	if s.idempotencyTTL > 0 {
+		at := st.acquireAt[requestID]
+		if at.IsZero() || now.Sub(at) > s.idempotencyTTL {
+			delete(st.acquireByRequest, requestID)
+			delete(st.acquireAt, requestID)
+			return lockResponse{}, false
+		}
+	}
+	return resp, true
+}
+
+func (s *lockService) getReleaseIdempotentLocked(st *sessionState, requestID string, now time.Time) (string, bool) {
+	token, ok := st.releaseByRequest[requestID]
+	if !ok {
+		return "", false
+	}
+	if s.idempotencyTTL > 0 {
+		at := st.releaseAt[requestID]
+		if at.IsZero() || now.Sub(at) > s.idempotencyTTL {
+			delete(st.releaseByRequest, requestID)
+			delete(st.releaseAt, requestID)
+			return "", false
+		}
+	}
+	return token, true
 }
 
 // evictOldestAcquireLocked 淘汰最旧 acquire request_id。
@@ -722,6 +727,7 @@ func (s *lockService) evictOldestAcquireLocked(st *sessionState) {
 		st.acquireOrder = st.acquireOrder[1:]
 		if _, ok := st.acquireByRequest[oldest]; ok {
 			delete(st.acquireByRequest, oldest)
+			delete(st.acquireAt, oldest)
 			return
 		}
 	}
@@ -734,6 +740,7 @@ func (s *lockService) evictOldestReleaseLocked(st *sessionState) {
 		st.releaseOrder = st.releaseOrder[1:]
 		if _, ok := st.releaseByRequest[oldest]; ok {
 			delete(st.releaseByRequest, oldest)
+			delete(st.releaseAt, oldest)
 			return
 		}
 	}
@@ -1005,7 +1012,12 @@ func peerKeyFromContext(ctx context.Context) string {
 	if !ok || p == nil || p.Addr == nil {
 		return "unknown"
 	}
-	return p.Addr.String()
+	addr := p.Addr.String()
+	host, _, err := net.SplitHostPort(addr)
+	if err == nil && host != "" {
+		return host
+	}
+	return addr
 }
 
 func grpcServerAuthUnaryInterceptor(expectedToken string, m *serverMetrics) grpc.UnaryServerInterceptor {
@@ -1104,18 +1116,23 @@ func grpcServerStreamMetricsInterceptor(m *serverMetrics) grpc.StreamServerInter
 	}
 }
 
-func startMetricsReporter(ctx context.Context, m *serverMetrics) {
+func startMetricsReporter(ctx context.Context, m *serverMetrics, limiter *rateLimiter) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	report := func() {
+		limiterSize := 0
+		if limiter != nil {
+			limiterSize = limiter.size()
+		}
 		log.Printf(
-			"metrics unary_calls=%d unary_failures=%d stream_calls=%d stream_failures=%d auth_failures=%d rate_limited=%d active_watchers=%d session_invalidations=%d",
+			"metrics unary_calls=%d unary_failures=%d stream_calls=%d stream_failures=%d auth_failures=%d rate_limited=%d rate_limiter_entries=%d active_watchers=%d session_invalidations=%d",
 			m.unaryCalls.Load(),
 			m.unaryFailures.Load(),
 			m.streamCalls.Load(),
 			m.streamFailures.Load(),
 			m.authFailures.Load(),
 			m.rateLimited.Load(),
+			limiterSize,
 			m.activeWatchers.Load(),
 			m.sessionInvalidation.Load(),
 		)
@@ -1146,6 +1163,8 @@ func main() {
 	shardCount := envAsInt("LOCK_SERVER_SHARDS", 1024)
 	defaultLeaseMS := envAsInt("LOCK_SERVER_DEFAULT_LEASE_MS", 8000)
 	maxLeaseMS := envAsInt("LOCK_SERVER_MAX_LEASE_MS", 60000)
+	idempotencyEntries := envAsInt("LOCK_SERVER_IDEMPOTENCY_ENTRIES", 65536)
+	idempotencyTTLMS := envAsInt("LOCK_SERVER_IDEMPOTENCY_TTL_MS", int(defaultIdempotencyTTL/time.Millisecond))
 	authToken := os.Getenv("LOCK_SERVER_AUTH_TOKEN")
 	rateLimitRPS := envAsInt("LOCK_SERVER_RATE_LIMIT_RPS", 200)
 	rateLimitBurst := envAsInt("LOCK_SERVER_RATE_LIMIT_BURST", 400)
@@ -1157,6 +1176,8 @@ func main() {
 
 	serverID := newServerID()
 	svc := newLockService(locker, time.Duration(defaultLeaseMS)*time.Millisecond, time.Duration(maxLeaseMS)*time.Millisecond, serverID)
+	svc.maxIdempotencyEntries = idempotencyEntries
+	svc.idempotencyTTL = time.Duration(idempotencyTTLMS) * time.Millisecond
 	metrics := &serverMetrics{}
 	svc.metrics = metrics
 	limiter := newRateLimiter(rateLimitRPS, rateLimitBurst)
@@ -1185,11 +1206,11 @@ func main() {
 		serveErr <- grpcServer.Serve(lis)
 	}()
 
-	log.Printf("lock grpc server listening on %s server_id=%s protocol=%s auth_enabled=%t rate_rps=%d rate_burst=%d", addr, serverID, protocolVersion, authToken != "", rateLimitRPS, rateLimitBurst)
+	log.Printf("lock grpc server listening on %s server_id=%s protocol=%s auth_enabled=%t rate_rps=%d rate_burst=%d idempotency_entries=%d idempotency_ttl_ms=%d", addr, serverID, protocolVersion, authToken != "", rateLimitRPS, rateLimitBurst, idempotencyEntries, idempotencyTTLMS)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	go startMetricsReporter(ctx, metrics)
+	go startMetricsReporter(ctx, metrics, limiter)
 
 	select {
 	case <-ctx.Done():
