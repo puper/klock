@@ -745,8 +745,8 @@ func newServerID() string {
 func main() {
 	addr := envOrDefault("LOCK_SERVER_ADDR", ":8080")
 	shardCount := envAsInt("LOCK_SERVER_SHARDS", 1024)
-	defaultLeaseMS := envAsInt("LOCK_SERVER_DEFAULT_LEASE_MS", 30000)
-	maxLeaseMS := envAsInt("LOCK_SERVER_MAX_LEASE_MS", 300000)
+	defaultLeaseMS := envAsInt("LOCK_SERVER_DEFAULT_LEASE_MS", 8000)
+	maxLeaseMS := envAsInt("LOCK_SERVER_MAX_LEASE_MS", 60000)
 
 	locker, err := hierlock.New(shardCount)
 	if err != nil {

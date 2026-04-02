@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -35,12 +36,24 @@ const (
 	defaultServerLeaseBuffer  = 3 * time.Second
 	defaultLocalTTLMultiplier = 2
 	defaultSweepInterval      = 200 * time.Millisecond
+	defaultAcquireRetryDelay  = 100 * time.Millisecond
 )
 
 type LockOption struct {
+	// Timeout 控制“整次加锁调用”的总等待时长（包含内部重试）。
+	//
+	// 语义：
+	// 1. =0：表示一直重试直到成功或 ctx 结束（until 模式）。
+	// 2. >0：在该总时长内自动重试；超时后返回 context deadline exceeded。
+	// 3. 不影响已拿到锁后的持有时长。
 	Timeout time.Duration
-	// LocalTTL sets a fixed local validity duration for this lock handle.
-	// If zero, the lock uses client default local TTL and auto-renews on each heartbeat success.
+	// LocalTTL 控制“本地句柄有效期”。
+	//
+	// 语义：
+	// 1. >0：使用固定本地 TTL；到期后触发 EventLocalExpired，不会自动续期。
+	// 2. <=0：使用客户端默认 TTL（Config.LocalTTL），并在每次 heartbeat 成功后自动续期。
+	// 3. 这是客户端本地安全边界，不等同于服务端 session lease。
+	//    典型建议：LocalTTL 小于服务端 lease，让客户端先失效、服务端后兜底回收。
 	LocalTTL time.Duration
 }
 
@@ -48,15 +61,15 @@ type EventType string
 
 const (
 	// EventServerChanged 表示服务实例切换导致本地会话失效。
-	EventServerChanged    EventType = "server_changed"
+	EventServerChanged EventType = "server_changed"
 	// EventProtocolMismatch 表示协议版本不一致。
 	EventProtocolMismatch EventType = "protocol_mismatch"
 	// EventSessionGone 表示会话失效（过期/不存在/主动关闭/心跳连续失败）。
-	EventSessionGone      EventType = "session_gone"
+	EventSessionGone EventType = "session_gone"
 	// EventUnlocked 表示主动解锁成功。
-	EventUnlocked         EventType = "unlocked"
+	EventUnlocked EventType = "unlocked"
 	// EventLocalExpired 表示本地 TTL 到期，锁在客户端侧失效。
-	EventLocalExpired     EventType = "local_expired"
+	EventLocalExpired EventType = "local_expired"
 )
 
 // LockEvent 是锁状态变化事件。
@@ -107,8 +120,8 @@ type Client struct {
 	sweepStop           context.CancelFunc
 	sessionInitInFlight bool
 	sessionInitDone     chan struct{}
-	heartbeatWG         sync.WaitGroup
-	sweepWG             sync.WaitGroup
+	bgActive            int
+	bgDone              chan struct{}
 	closed              bool
 	nextReq             uint64
 	handles             map[string]*LockHandle
@@ -258,72 +271,138 @@ func NewWithConfig(baseURL string, httpClient *http.Client, cfg Config) *Client 
 		http:    httpClient,
 		cfg:     cfg,
 		handles: make(map[string]*LockHandle),
+		bgDone:  make(chan struct{}),
 	}
+	close(c.bgDone)
 
 	sweepCtx, sweepCancel := context.WithCancel(context.Background())
 	c.sweepStop = sweepCancel
-	c.sweepWG.Add(1)
+	c.markBGStart()
 	go c.localExpiryLoop(sweepCtx)
 	return c
 }
 
 // Lock 获取二级锁。
 func (c *Client) Lock(ctx context.Context, p1, p2 string, opt LockOption) (*LockHandle, error) {
-	sessionID, err := c.ensureSession(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	acquireReqID := c.nextRequestID("acq")
-	resp, err := c.acquire(ctx, lockRequest{
-		Scope:     ScopeL2,
-		P1:        p1,
-		P2:        p2,
-		TimeoutMS: durationMS(opt.Timeout),
-		SessionID: sessionID,
-		RequestID: acquireReqID,
-	})
-	if err != nil {
-		c.handleAPIError(sessionID, err)
-		return nil, err
-	}
-
-	c.observeServer(resp.ServerID)
-	h := c.newHandle(resp, opt)
-
-	c.mu.Lock()
-	c.handles[h.Token] = h
-	c.mu.Unlock()
-	return h, nil
+	return c.lockWithScope(ctx, ScopeL2, p1, p2, opt)
 }
 
 // LockL1 获取一级锁。
 func (c *Client) LockL1(ctx context.Context, p1 string, opt LockOption) (*LockHandle, error) {
-	sessionID, err := c.ensureSession(ctx)
-	if err != nil {
-		return nil, err
-	}
+	return c.lockWithScope(ctx, ScopeL1, p1, "", opt)
+}
 
+// lockWithScope 是 Lock/LockL1 的统一实现：
+// 1. 支持 Timeout=0 的 until 模式；
+// 2. 支持 Timeout>0 的总时长自动重试模式。
+func (c *Client) lockWithScope(ctx context.Context, scope Scope, p1, p2 string, opt LockOption) (*LockHandle, error) {
+	waitCtx := ctx
+	cancel := func() {}
+	if opt.Timeout > 0 {
+		waitCtx, cancel = context.WithTimeout(ctx, opt.Timeout)
+	}
+	defer cancel()
 	acquireReqID := c.nextRequestID("acq")
-	resp, err := c.acquire(ctx, lockRequest{
-		Scope:     ScopeL1,
-		P1:        p1,
-		TimeoutMS: durationMS(opt.Timeout),
-		SessionID: sessionID,
-		RequestID: acquireReqID,
-	})
-	if err != nil {
+
+	for {
+		if err := waitCtx.Err(); err != nil {
+			return nil, err
+		}
+
+		sessionID, err := c.ensureSession(waitCtx)
+		if err != nil {
+			if !isRetriableAcquireError(err) {
+				return nil, err
+			}
+			if err := sleepWithContext(waitCtx, defaultAcquireRetryDelay); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		attemptTimeout := int64(0)
+		if dl, ok := waitCtx.Deadline(); ok {
+			remain := time.Until(dl)
+			if remain <= 0 {
+				return nil, waitCtx.Err()
+			}
+			attemptTimeout = durationMS(remain)
+			if attemptTimeout <= 0 {
+				attemptTimeout = 1
+			}
+		}
+
+		resp, err := c.acquire(waitCtx, lockRequest{
+			Scope:     scope,
+			P1:        p1,
+			P2:        p2,
+			TimeoutMS: attemptTimeout,
+			SessionID: sessionID,
+			RequestID: acquireReqID,
+		})
+		if err == nil {
+			c.observeServer(resp.ServerID)
+			h := c.newHandle(resp, opt)
+			c.mu.Lock()
+			c.handles[h.Token] = h
+			c.mu.Unlock()
+			return h, nil
+		}
+
 		c.handleAPIError(sessionID, err)
-		return nil, err
+		if !isRetriableAcquireError(err) {
+			return nil, err
+		}
+		if err := sleepWithContext(waitCtx, defaultAcquireRetryDelay); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// isRetriableAcquireError 判断是否应继续重试加锁。
+func isRetriableAcquireError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
 	}
 
-	c.observeServer(resp.ServerID)
-	h := c.newHandle(resp, opt)
+	var ae *APIError
+	if errors.As(err, &ae) {
+		switch ae.Code {
+		case "LOCK_TIMEOUT", "SESSION_GONE", "SESSION_NOT_FOUND", "SERVER_INSTANCE_MISMATCH":
+			return true
+		}
+		if ae.Status >= 500 {
+			return true
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
 
-	c.mu.Lock()
-	c.handles[h.Token] = h
-	c.mu.Unlock()
-	return h, nil
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return true
+	}
+
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return true
+	}
+	return false
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // newHandle 根据服务端响应构造本地句柄并设置初始 TTL。
@@ -392,6 +471,7 @@ func (c *Client) Close(ctx context.Context) error {
 	sessionID := c.sessionID
 	hbStop := c.heartbeatStop
 	sweepStop := c.sweepStop
+	bgDone := c.bgDone
 	c.sessionID = ""
 	c.heartbeatStop = nil
 	c.sweepStop = nil
@@ -415,10 +495,7 @@ func (c *Client) Close(ctx context.Context) error {
 	if sweepStop != nil {
 		sweepStop()
 	}
-	if err := waitGroupWithContext(ctx, &c.heartbeatWG); err != nil {
-		return err
-	}
-	if err := waitGroupWithContext(ctx, &c.sweepWG); err != nil {
+	if err := waitChannelWithContext(ctx, bgDone); err != nil {
 		return err
 	}
 	if sessionID == "" {
@@ -458,6 +535,13 @@ func (c *Client) ensureSession(ctx context.Context) (string, error) {
 				c.mu.Unlock()
 				return "", err
 			}
+			if c.closed {
+				c.mu.Unlock()
+				closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = c.closeSessionRemote(closeCtx, resp.SessionID)
+				cancel()
+				return "", errors.New("client is closed")
+			}
 			if c.sessionID == "" {
 				c.sessionID = resp.SessionID
 				if resp.ServerID != "" {
@@ -465,7 +549,7 @@ func (c *Client) ensureSession(ctx context.Context) (string, error) {
 				}
 				hbCtx, cancel := context.WithCancel(context.Background())
 				c.heartbeatStop = cancel
-				c.heartbeatWG.Add(1)
+				c.markBGStartLocked()
 				go c.heartbeatLoop(hbCtx, resp.SessionID)
 			}
 			id := c.sessionID
@@ -500,7 +584,7 @@ func (c *Client) invalidateSession(sessionID string) {
 // heartbeatLoop 定期续约会话。
 // 连续失败达到阈值后触发 fail-closed。
 func (c *Client) heartbeatLoop(ctx context.Context, sessionID string) {
-	defer c.heartbeatWG.Done()
+	defer c.markBGDone()
 
 	ticker := time.NewTicker(c.cfg.HeartbeatInterval)
 	defer ticker.Stop()
@@ -551,7 +635,7 @@ func (c *Client) renewAutoHandles(sessionID string) {
 
 // localExpiryLoop 周期扫描本地句柄，超过 TTL 则触发 local_expired 事件。
 func (c *Client) localExpiryLoop(ctx context.Context) {
-	defer c.sweepWG.Done()
+	defer c.markBGDone()
 
 	ticker := time.NewTicker(c.cfg.LocalSweepInterval)
 	defer ticker.Stop()
@@ -877,18 +961,34 @@ func durationMS(d time.Duration) int64 {
 	return d.Milliseconds()
 }
 
-// waitGroupWithContext 在 context 约束下等待 WaitGroup 完成。
-func waitGroupWithContext(ctx context.Context, wg *sync.WaitGroup) error {
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
+// waitChannelWithContext 在 context 约束下等待 done 信号。
+func waitChannelWithContext(ctx context.Context, done <-chan struct{}) error {
 	select {
 	case <-done:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+func (c *Client) markBGStart() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.markBGStartLocked()
+}
+
+func (c *Client) markBGStartLocked() {
+	if c.bgActive == 0 {
+		c.bgDone = make(chan struct{})
+	}
+	c.bgActive++
+}
+
+func (c *Client) markBGDone() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.bgActive--
+	if c.bgActive == 0 {
+		close(c.bgDone)
 	}
 }

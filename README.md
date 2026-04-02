@@ -49,8 +49,8 @@ go run ./server
 
 1. `LOCK_SERVER_ADDR`（默认 `:8080`）
 2. `LOCK_SERVER_SHARDS`（默认 `1024`）
-3. `LOCK_SERVER_DEFAULT_LEASE_MS`（默认 `30000`）
-4. `LOCK_SERVER_MAX_LEASE_MS`（默认 `300000`）
+3. `LOCK_SERVER_DEFAULT_LEASE_MS`（默认 `8000`）
+4. `LOCK_SERVER_MAX_LEASE_MS`（默认 `60000`）
 
 ### 2) 客户端使用
 
@@ -97,7 +97,7 @@ func main() {
 	defer cancel()
 
 	h, err := c.Lock(lockCtx, "tenant-1", "res-1", client.LockOption{
-		Timeout: 1200 * time.Millisecond,
+		Timeout: 1200 * time.Millisecond, // 整次加锁调用的总等待时间（含内部重试）；0 表示一直重试直到 ctx 结束
 	})
 	if err != nil {
 		panic(err)
