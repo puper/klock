@@ -37,6 +37,11 @@ type fakeLockRPCServer struct {
 	acquireStarted             chan struct{}
 	acquireStartSent           bool
 	acquireBlock               chan struct{}
+	createSessionCalls         int
+	createSessionFailFor       int
+	createSessionStarted       chan struct{}
+	createSessionStartSent     bool
+	createSessionBlock         chan struct{}
 	createSessionDelay         time.Duration
 	closeSessionDelay          time.Duration
 	watchBreakAfterEstablished bool
@@ -66,14 +71,33 @@ func (f *fakeLockRPCServer) CreateSession(ctx context.Context, _ *lockrpcpb.Crea
 		return nil, err
 	}
 	f.mu.Lock()
+	f.createSessionCalls++
+	call := f.createSessionCalls
 	delay := f.createSessionDelay
+	started := f.createSessionStarted
+	if started != nil && !f.createSessionStartSent {
+		close(started)
+		f.createSessionStartSent = true
+	}
+	block := f.createSessionBlock
+	failFor := f.createSessionFailFor
 	f.mu.Unlock()
+	if block != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-block:
+		}
+	}
 	if delay > 0 {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-time.After(delay):
 		}
+	}
+	if call <= failFor {
+		return nil, status.Error(codes.Unavailable, "simulated create session failure")
 	}
 	return &lockrpcpb.SessionResponse{
 		SessionId:       "sess-1",
@@ -719,6 +743,88 @@ func TestCloseWaitsForInFlightCreateSessionCleanup(t *testing.T) {
 	defer fake.mu.Unlock()
 	if fake.closeSessionCalls != 1 {
 		t.Fatalf("expected exactly one CloseSession call after in-flight createSession cleanup, got %d", fake.closeSessionCalls)
+	}
+}
+
+func TestEnsureSessionWaitersUnblockAfterCreateFailure(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer lis.Close()
+
+	grpcSrv := grpc.NewServer()
+	fake := &fakeLockRPCServer{
+		authToken:            "test-token",
+		createSessionFailFor: 1,
+		createSessionStarted: make(chan struct{}),
+		createSessionBlock:   make(chan struct{}),
+	}
+	lockrpcpb.RegisterLockServiceServer(grpcSrv, fake)
+	go grpcSrv.Serve(lis)
+	defer grpcSrv.Stop()
+
+	c := NewWithConfig("grpc://"+lis.Addr().String(), Config{
+		SessionLease:      2 * time.Second,
+		HeartbeatInterval: 200 * time.Millisecond,
+		HeartbeatTimeout:  500 * time.Millisecond,
+		LocalTTL:          2 * time.Second,
+		AuthToken:         "test-token",
+	})
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = c.Close(closeCtx)
+	}()
+
+	initErrCh := make(chan error, 1)
+	go func() {
+		_, err := c.ensureSession(context.Background())
+		initErrCh <- err
+	}()
+
+	select {
+	case <-fake.createSessionStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for initial CreateSession start")
+	}
+
+	const waiters = 8
+	waiterDone := make(chan error, waiters)
+	for i := 0; i < waiters; i++ {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_, err := c.ensureSession(ctx)
+			waiterDone <- err
+		}()
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	close(fake.createSessionBlock)
+
+	select {
+	case err := <-initErrCh:
+		if err == nil {
+			t.Fatal("expected first ensureSession to fail")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial ensureSession did not return after create failure")
+	}
+
+	for i := 0; i < waiters; i++ {
+		select {
+		case err := <-waiterDone:
+			if err != nil && errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("waiter %d timed out; possible unblock regression: %v", i, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("waiter %d did not return; possible unblock regression", i)
+		}
+	}
+
+	if _, err := c.ensureSession(context.Background()); err != nil {
+		t.Fatalf("expected ensureSession recovery after transient create failure, got %v", err)
 	}
 }
 

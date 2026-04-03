@@ -722,19 +722,27 @@ func (c *Client) ensureSession(ctx context.Context) (string, error) {
 
 			c.mu.Lock()
 			c.sessionInitInFlight = false
-			c.sessionInitDone = nil
 			if err != nil {
-				c.mu.Unlock()
+				// Wake waiters while still holding the state lock so they cannot
+				// observe a cleared channel before the notification is published.
 				close(done)
+				if c.sessionInitDone == done {
+					c.sessionInitDone = nil
+				}
+				c.mu.Unlock()
 				c.sessionInitWG.Done()
 				return "", err
 			}
 			if c.closed {
+				// Keep the same ordering guarantees as the error path.
+				close(done)
+				if c.sessionInitDone == done {
+					c.sessionInitDone = nil
+				}
 				c.mu.Unlock()
 				closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 				_ = c.closeSessionRemoteManaged(closeCtx, resp.SessionID)
 				cancel()
-				close(done)
 				c.sessionInitWG.Done()
 				return "", errors.New("client is closed")
 			}
@@ -753,8 +761,11 @@ func (c *Client) ensureSession(ctx context.Context) (string, error) {
 				go c.watchLoop(wCtx, resp.SessionID)
 			}
 			id := c.sessionID
-			c.mu.Unlock()
 			close(done)
+			if c.sessionInitDone == done {
+				c.sessionInitDone = nil
+			}
+			c.mu.Unlock()
 			c.sessionInitWG.Done()
 			return id, nil
 		}
