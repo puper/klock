@@ -143,6 +143,14 @@ func main() {
 4. 服务端租约（若未手动指定 `SessionLease`）：
    `server lease = LocalTTL + ServerLeaseBuffer`
 
+语义边界（重点）：
+
+1. `LockOption.LocalTTL` 仅在客户端本地生效，服务端不可见。
+2. `Config.SessionLease` 是客户端向服务端请求的会话租约时长；最终生效值仍受服务端默认值/上限约束。
+3. 服务端租约是 session 级别（一个 `Client` 实例通常对应一个 session），不是“每把锁独立租约”。
+4. 若客户端进程崩溃（未执行 `Unlock/Close`），锁通常在服务端 lease 到期后被回收。
+5. 为降低不一致窗口，建议保证 `per-lock LocalTTL <= Config.LocalTTL < effective server lease`。
+
 设计目标：
 
 1. 客户端本地比服务端更早失效，减少异常写入窗口

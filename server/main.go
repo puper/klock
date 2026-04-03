@@ -88,6 +88,17 @@ type lockResponse struct {
 	ProtocolVersion string `json:"protocol_version"`
 }
 
+type acquireFingerprint struct {
+	scope lockScope
+	p1    string
+	p2    string
+}
+
+type acquireIdempotentEntry struct {
+	resp        lockResponse
+	fingerprint acquireFingerprint
+}
+
 // apiError 用于服务内部的结构化错误表达。
 type apiError struct {
 	status int
@@ -126,7 +137,7 @@ type sessionState struct {
 	timerSeq    uint64
 	invalidated chan struct{}
 
-	acquireByRequest map[string]lockResponse
+	acquireByRequest map[string]acquireIdempotentEntry
 	acquireAt        map[string]time.Time
 	acquireOrder     []string
 	acquireHead      int
@@ -277,7 +288,7 @@ func (s *lockService) createSession(req createSessionRequest) (sessionResponse, 
 		lease:            lease,
 		expiresAt:        now.Add(lease),
 		invalidated:      make(chan struct{}),
-		acquireByRequest: make(map[string]lockResponse),
+		acquireByRequest: make(map[string]acquireIdempotentEntry),
 		acquireAt:        make(map[string]time.Time),
 		acquireOrder:     make([]string, 0, 64),
 		releaseByRequest: make(map[string]string),
@@ -391,7 +402,10 @@ func (s *lockService) acquire(ctx context.Context, req lockRequest) (lockRespons
 		}
 		return lockResponse{}, &apiError{status: http.StatusNotFound, code: "SESSION_NOT_FOUND", msg: "session not found"}
 	}
-	if cached, ok := s.getAcquireIdempotentLocked(st, req.RequestID, time.Now()); ok {
+	if cached, ok, err := s.getAcquireIdempotentLocked(st, req, time.Now()); err != nil {
+		s.mu.Unlock()
+		return lockResponse{}, err
+	} else if ok {
 		s.mu.Unlock()
 		return cached, nil
 	}
@@ -451,12 +465,16 @@ func (s *lockService) acquire(ctx context.Context, req lockRequest) (lockRespons
 		}
 		return lockResponse{}, &apiError{status: http.StatusNotFound, code: "SESSION_NOT_FOUND", msg: "session not found"}
 	}
-	if cached, ok := s.getAcquireIdempotentLocked(st, req.RequestID, time.Now()); ok {
+	if cached, ok, err := s.getAcquireIdempotentLocked(st, req, time.Now()); err != nil {
+		s.mu.Unlock()
+		h.safeUnlock()
+		return lockResponse{}, err
+	} else if ok {
 		s.mu.Unlock()
 		h.safeUnlock()
 		return cached, nil
 	}
-	s.putAcquireIdempotentLocked(st, req.RequestID, resp)
+	s.putAcquireIdempotentLocked(st, req, resp)
 	st.locksByToken[h.token] = h
 	s.tokens[h.token] = h
 	s.mu.Unlock()
@@ -694,7 +712,8 @@ func (s *lockService) drainForRestart() {
 }
 
 // putAcquireIdempotentLocked 写入 acquire 幂等缓存并执行有界淘汰。
-func (s *lockService) putAcquireIdempotentLocked(st *sessionState, requestID string, resp lockResponse) {
+func (s *lockService) putAcquireIdempotentLocked(st *sessionState, req lockRequest, resp lockResponse) {
+	requestID := req.RequestID
 	if _, exists := st.acquireByRequest[requestID]; exists {
 		return
 	}
@@ -705,7 +724,10 @@ func (s *lockService) putAcquireIdempotentLocked(st *sessionState, requestID str
 	if len(st.acquireByRequest) >= maxEntries {
 		s.evictOldestAcquireLocked(st)
 	}
-	st.acquireByRequest[requestID] = resp
+	st.acquireByRequest[requestID] = acquireIdempotentEntry{
+		resp:        resp,
+		fingerprint: fingerprintAcquireRequest(req),
+	}
 	st.acquireAt[requestID] = time.Now()
 	st.acquireOrder = append(st.acquireOrder, requestID)
 }
@@ -727,20 +749,41 @@ func (s *lockService) putReleaseIdempotentLocked(st *sessionState, requestID, to
 	st.releaseOrder = append(st.releaseOrder, requestID)
 }
 
-func (s *lockService) getAcquireIdempotentLocked(st *sessionState, requestID string, now time.Time) (lockResponse, bool) {
-	resp, ok := st.acquireByRequest[requestID]
+func (s *lockService) getAcquireIdempotentLocked(st *sessionState, req lockRequest, now time.Time) (lockResponse, bool, error) {
+	requestID := req.RequestID
+	entry, ok := st.acquireByRequest[requestID]
 	if !ok {
-		return lockResponse{}, false
+		return lockResponse{}, false, nil
 	}
 	if s.idempotencyTTL > 0 {
 		at := st.acquireAt[requestID]
 		if at.IsZero() || now.Sub(at) > s.idempotencyTTL {
 			delete(st.acquireByRequest, requestID)
 			delete(st.acquireAt, requestID)
-			return lockResponse{}, false
+			return lockResponse{}, false, nil
 		}
 	}
-	return resp, true
+	if entry.fingerprint != fingerprintAcquireRequest(req) {
+		return lockResponse{}, false, &apiError{
+			status: http.StatusConflict,
+			code:   "IDEMPOTENCY_CONFLICT",
+			msg:    "request_id already used for a different acquire request",
+		}
+	}
+	return entry.resp, true, nil
+}
+
+func fingerprintAcquireRequest(req lockRequest) acquireFingerprint {
+	p2 := req.P2
+	if req.Scope == scopeL1 {
+		// L1 锁语义只依赖 p1，忽略 p2 以避免无意义的幂等冲突。
+		p2 = ""
+	}
+	return acquireFingerprint{
+		scope: req.Scope,
+		p1:    req.P1,
+		p2:    p2,
+	}
 }
 
 func (s *lockService) getReleaseIdempotentLocked(st *sessionState, requestID string, now time.Time) (string, bool) {

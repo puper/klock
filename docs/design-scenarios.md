@@ -191,6 +191,9 @@
 
 1. `request_id` 幂等仅在“同 session + 窗口内”成立。
 2. 客户端 `Done()` 是本地视角失效通知，不等同于分布式全局线性化事件。
+3. `LockOption.LocalTTL` 为客户端本地句柄语义，服务端不可见，也不会改变服务端 session lease。
+4. `SessionLease` 是客户端请求值，不是服务端静态配置项；最终值受服务端策略约束（默认值/上限）。
+5. 客户端崩溃且未主动 `Unlock/Close` 时，锁释放依赖服务端 session lease 到期回收。
 
 ## 6. 使用注意事项（强约束）
 

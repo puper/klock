@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"sync"
@@ -25,12 +26,19 @@ type fakeLockRPCServer struct {
 	releaseFailFor             int
 	releaseCalls               int
 	releaseRequestID           []string
+	releaseTokens              []string
 	failAcquireP2              string
 	failAcquireCode            codes.Code
+	failAcquireAPIErrorP2      string
+	failAcquireAPIError        *lockrpcpb.ErrorStatus
 	acquireTimeoutMS           []int64
 	acquireDeadlines           []time.Duration
 	acquireDelay               time.Duration
+	acquireStarted             chan struct{}
+	acquireStartSent           bool
+	acquireBlock               chan struct{}
 	createSessionDelay         time.Duration
+	closeSessionDelay          time.Duration
 	watchBreakAfterEstablished bool
 }
 
@@ -96,12 +104,27 @@ func (f *fakeLockRPCServer) Acquire(ctx context.Context, req *lockrpcpb.LockRequ
 	f.mu.Lock()
 	failP2 := f.failAcquireP2
 	failCode := f.failAcquireCode
+	failAPIErrorP2 := f.failAcquireAPIErrorP2
+	failAPIError := f.failAcquireAPIError
 	f.acquireTimeoutMS = append(f.acquireTimeoutMS, req.TimeoutMs)
 	if dl, ok := ctx.Deadline(); ok {
 		f.acquireDeadlines = append(f.acquireDeadlines, time.Until(dl))
 	}
 	delay := f.acquireDelay
+	started := f.acquireStarted
+	if started != nil && !f.acquireStartSent {
+		close(started)
+		f.acquireStartSent = true
+	}
+	block := f.acquireBlock
 	f.mu.Unlock()
+	if block != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-block:
+		}
+	}
 	if delay > 0 {
 		select {
 		case <-ctx.Done():
@@ -111,6 +134,11 @@ func (f *fakeLockRPCServer) Acquire(ctx context.Context, req *lockrpcpb.LockRequ
 	}
 	if failP2 != "" && req.P2 == failP2 {
 		return nil, status.Error(failCode, "simulated acquire failure")
+	}
+	if failAPIErrorP2 != "" && req.P2 == failAPIErrorP2 {
+		return &lockrpcpb.LockResponse{
+			Error: failAPIError,
+		}, nil
 	}
 	return &lockrpcpb.LockResponse{
 		Token:           "lk-1",
@@ -187,6 +215,7 @@ func (f *fakeLockRPCServer) Release(ctx context.Context, req *lockrpcpb.ReleaseR
 	f.releaseCalls++
 	call := f.releaseCalls
 	f.releaseRequestID = append(f.releaseRequestID, req.RequestId)
+	f.releaseTokens = append(f.releaseTokens, req.Token)
 	failFor := f.releaseFailFor
 	f.mu.Unlock()
 	if call <= failFor {
@@ -205,7 +234,15 @@ func (f *fakeLockRPCServer) CloseSession(ctx context.Context, _ *lockrpcpb.Close
 	}
 	f.mu.Lock()
 	f.closeSessionCalls++
+	delay := f.closeSessionDelay
 	f.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
 	return &lockrpcpb.CloseSessionResponse{
 		Closed:          true,
 		ServerId:        "srv-a",
@@ -427,6 +464,71 @@ func TestLockUncertainFailureTriggersFailClosedSession(t *testing.T) {
 	}
 }
 
+func TestLockIdempotencyConflictDoesNotFailCloseSession(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer lis.Close()
+
+	grpcSrv := grpc.NewServer()
+	fake := &fakeLockRPCServer{
+		authToken:            "test-token",
+		failAcquireAPIErrorP2: "res-idempotency-conflict",
+		failAcquireAPIError: &lockrpcpb.ErrorStatus{
+			Status:          409,
+			Code:            "IDEMPOTENCY_CONFLICT",
+			Message:         "request_id already used for a different acquire request",
+			ServerId:        "srv-a",
+			ProtocolVersion: protocolVersion,
+		},
+	}
+	lockrpcpb.RegisterLockServiceServer(grpcSrv, fake)
+	go grpcSrv.Serve(lis)
+	defer grpcSrv.Stop()
+
+	c := NewWithConfig("grpc://"+lis.Addr().String(), Config{
+		SessionLease:      2 * time.Second,
+		HeartbeatInterval: 200 * time.Millisecond,
+		HeartbeatTimeout:  500 * time.Millisecond,
+		LocalTTL:          2 * time.Second,
+		AuthToken:         "test-token",
+	})
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = c.Close(closeCtx)
+	}()
+
+	h1, err := c.Lock(context.Background(), "tenant-1", "res-hold", LockOption{})
+	if err != nil {
+		t.Fatalf("first lock failed: %v", err)
+	}
+	defer func() {
+		_ = h1.Unlock(context.Background())
+		<-h1.Done()
+	}()
+
+	_, err = c.Lock(context.Background(), "tenant-1", "res-idempotency-conflict", LockOption{Timeout: 300 * time.Millisecond})
+	var ae *APIError
+	if !errors.As(err, &ae) || ae.Code != "IDEMPOTENCY_CONFLICT" {
+		t.Fatalf("expected IDEMPOTENCY_CONFLICT, got: %v", err)
+	}
+
+	select {
+	case ev := <-h1.Done():
+		t.Fatalf("expected held lock to remain valid on idempotency conflict, got event type=%s code=%s", ev.Type, ev.ErrorCode)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	c.mu.Lock()
+	sessionID := c.sessionID
+	c.mu.Unlock()
+	if sessionID == "" {
+		t.Fatal("expected session to remain valid after idempotency conflict")
+	}
+}
+
 func TestWatchDisconnectTriggersBestEffortCloseSession(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -617,5 +719,82 @@ func TestCloseWaitsForInFlightCreateSessionCleanup(t *testing.T) {
 	defer fake.mu.Unlock()
 	if fake.closeSessionCalls != 1 {
 		t.Fatalf("expected exactly one CloseSession call after in-flight createSession cleanup, got %d", fake.closeSessionCalls)
+	}
+}
+
+func TestCloseDuringInFlightAcquireReleasesLateHandle(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer lis.Close()
+
+	grpcSrv := grpc.NewServer()
+	fake := &fakeLockRPCServer{
+		authToken:         "test-token",
+		acquireStarted:    make(chan struct{}),
+		acquireBlock:      make(chan struct{}),
+		closeSessionDelay: 200 * time.Millisecond,
+	}
+	lockrpcpb.RegisterLockServiceServer(grpcSrv, fake)
+	go grpcSrv.Serve(lis)
+	defer grpcSrv.Stop()
+
+	c := NewWithConfig("grpc://"+lis.Addr().String(), Config{
+		SessionLease:      2 * time.Second,
+		HeartbeatInterval: 200 * time.Millisecond,
+		HeartbeatTimeout:  500 * time.Millisecond,
+		LocalTTL:          2 * time.Second,
+		AuthToken:         "test-token",
+	})
+
+	if _, err := c.ensureSession(context.Background()); err != nil {
+		t.Fatalf("ensure session failed: %v", err)
+	}
+
+	lockDone := make(chan error, 1)
+	go func() {
+		_, err := c.Lock(context.Background(), "tenant-1", "res-close-after-acquire", LockOption{})
+		lockDone <- err
+	}()
+
+	<-fake.acquireStarted
+	closeDone := make(chan error, 1)
+	go func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		closeDone <- c.Close(closeCtx)
+	}()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		c.mu.Lock()
+		closed := c.closed
+		c.mu.Unlock()
+		if closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for client closed flag")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(fake.acquireBlock)
+
+	if err := <-closeDone; err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	err = <-lockDone
+	if err == nil || !strings.Contains(err.Error(), "client is closed") {
+		t.Fatalf("expected lock to fail with closed client, got %v", err)
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.releaseCalls != 1 {
+		t.Fatalf("expected close-race lock cleanup to issue one release, got %d", fake.releaseCalls)
+	}
+	if len(fake.releaseTokens) != 1 || fake.releaseTokens[0] != "lk-1" {
+		t.Fatalf("unexpected release token cleanup payload: %+v", fake.releaseTokens)
 	}
 }

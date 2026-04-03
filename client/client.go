@@ -426,7 +426,15 @@ func (c *Client) lockWithScope(ctx context.Context, scope Scope, p1, p2 string, 
 		if err == nil {
 			c.observeServer(resp.ServerID)
 			h := c.newHandle(resp, opt)
+			releaseReqID := c.nextRequestID("rel")
 			c.mu.Lock()
+			if c.closed {
+				c.mu.Unlock()
+				releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = c.unlockHandleWithRequestID(releaseCtx, h, releaseReqID)
+				releaseCancel()
+				return nil, errors.New("client is closed")
+			}
 			c.handles[h.Token] = h
 			c.mu.Unlock()
 			return h, nil
@@ -444,13 +452,21 @@ func (c *Client) lockWithScope(ctx context.Context, scope Scope, p1, p2 string, 
 	}
 }
 
-func isServerExplicitlyLockConflict(err error) bool {
+func isServerDeterministicAcquireFailure(err error) bool {
 	var ae *APIError
-	return errors.As(err, &ae) && ae.Code == "LOCK_TIMEOUT"
+	if !errors.As(err, &ae) {
+		return false
+	}
+	switch ae.Code {
+	case "LOCK_TIMEOUT", "IDEMPOTENCY_CONFLICT":
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *Client) failClosedOnUncertainLockFailure(sessionID string, cause error) {
-	if sessionID == "" || isServerExplicitlyLockConflict(cause) {
+	if sessionID == "" || isServerDeterministicAcquireFailure(cause) {
 		return
 	}
 	c.invalidateSession(sessionID)

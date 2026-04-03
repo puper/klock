@@ -38,6 +38,70 @@ func TestIdempotentAcquireByRequestID(t *testing.T) {
 	}
 }
 
+func TestAcquireIdempotencyConflictOnDifferentRequestFingerprint(t *testing.T) {
+	svc := newLockService(hierlock.MustNew(16), 200*time.Millisecond, time.Second, "srv-test")
+	sess, err := svc.createSession(createSessionRequest{})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	_, err = svc.acquire(context.Background(), lockRequest{
+		Scope:     scopeL2,
+		P1:        "tenant-1",
+		P2:        "res-1",
+		SessionID: sess.SessionID,
+		RequestID: "req-1",
+	})
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+
+	_, err = svc.acquire(context.Background(), lockRequest{
+		Scope:     scopeL2,
+		P1:        "tenant-1",
+		P2:        "res-2",
+		SessionID: sess.SessionID,
+		RequestID: "req-1",
+	})
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.code != "IDEMPOTENCY_CONFLICT" {
+		t.Fatalf("expected idempotency conflict, got: %v", err)
+	}
+}
+
+func TestAcquireIdempotencyL1IgnoresP2InFingerprint(t *testing.T) {
+	svc := newLockService(hierlock.MustNew(16), 200*time.Millisecond, time.Second, "srv-test")
+	sess, err := svc.createSession(createSessionRequest{})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	r1, err := svc.acquire(context.Background(), lockRequest{
+		Scope:     scopeL1,
+		P1:        "tenant-1",
+		P2:        "ignored-a",
+		SessionID: sess.SessionID,
+		RequestID: "req-1",
+	})
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+
+	r2, err := svc.acquire(context.Background(), lockRequest{
+		Scope:     scopeL1,
+		P1:        "tenant-1",
+		P2:        "ignored-b",
+		SessionID: sess.SessionID,
+		RequestID: "req-1",
+	})
+	if err != nil {
+		t.Fatalf("second acquire: %v", err)
+	}
+	if r1.Token != r2.Token || r1.Fence != r2.Fence {
+		t.Fatalf("expected idempotent acquire for l1 with varying p2, got token/fence (%s,%d) vs (%s,%d)", r1.Token, r1.Fence, r2.Token, r2.Fence)
+	}
+}
+
 func TestFencingTokenMonotonic(t *testing.T) {
 	// 验证：fence 单调递增。
 	svc := newLockService(hierlock.MustNew(16), time.Second, 5*time.Second, "srv-test")
@@ -305,13 +369,13 @@ func TestAcquireIdempotencyUsesBoundedEviction(t *testing.T) {
 func TestEvictOldestAcquireCompactsOrderQueue(t *testing.T) {
 	svc := newLockService(hierlock.MustNew(16), time.Second, 5*time.Second, "srv-test")
 	st := &sessionState{
-		acquireByRequest: make(map[string]lockResponse),
+		acquireByRequest: make(map[string]acquireIdempotentEntry),
 		acquireAt:        make(map[string]time.Time),
 		acquireOrder:     make([]string, 0, 128),
 	}
 	for i := 0; i < 96; i++ {
 		id := fmt.Sprintf("acq-%d", i)
-		st.acquireByRequest[id] = lockResponse{Token: id}
+		st.acquireByRequest[id] = acquireIdempotentEntry{resp: lockResponse{Token: id}}
 		st.acquireAt[id] = time.Now()
 		st.acquireOrder = append(st.acquireOrder, id)
 	}
