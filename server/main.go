@@ -901,7 +901,7 @@ func (g *grpcServer) rpcFromErr(err error) *lockrpcpb.ErrorStatus {
 }
 
 func checkProtocolValue(v string) error {
-	if v == "" || v == protocolVersion {
+	if v == protocolVersion {
 		return nil
 	}
 	return &apiError{status: http.StatusConflict, code: "PROTOCOL_MISMATCH", msg: "protocol version mismatch"}

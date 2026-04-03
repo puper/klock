@@ -36,7 +36,6 @@
 ```
 
 详细设计与逐场景分析见：[docs/design-scenarios.md](docs/design-scenarios.md)。
-gRPC 双向流迁移设计见：[docs/grpc-migration.md](docs/grpc-migration.md)。
 
 ## 快速开始
 
@@ -168,6 +167,12 @@ func main() {
 当服务端优雅重启时，会向会话 watch 流广播 `SESSION_INVALIDATED`，客户端会立刻触发 `Done()` 失效事件。
 服务端默认开启基础限流（可配置），并支持 `authorization: Bearer <token>` 鉴权。
 服务端会定期输出指标日志，其中 `rate_limiter_entries` 表示当前限流分桶数量。
+
+错误通道约定（纯 gRPC）：
+
+1. 业务错误通过响应体 `error` 字段返回（`proto.ErrorStatus`），例如 `SESSION_GONE`、`LOCK_TIMEOUT`、`SERVER_INSTANCE_MISMATCH`。
+2. 传输/拦截器错误通过 gRPC status 返回（如 `Unauthenticated`、`ResourceExhausted`、`Unavailable`）。
+3. 客户端调用必须同时检查 `err` 和 `resp.error`，任一存在都视为失败。
 
 ## 协议生成
 
