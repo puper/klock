@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -21,6 +20,8 @@ import (
 
 	"github.com/puper/klock/pkg/hierlock"
 	"github.com/puper/klock/pkg/lockrpcpb"
+	"github.com/puper/klock/pkg/logger"
+	"go.uber.org/zap"
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -1206,7 +1207,13 @@ func grpcServerUnaryMetricsInterceptor(m *serverMetrics) grpc.UnaryServerInterce
 			m.unaryFailures.Add(1)
 			code = withErr.GetError().GetCode()
 		}
-		log.Printf("grpc_unary method=%s code=%s duration_ms=%d", info.FullMethod, code, duration.Milliseconds())
+		zap.L().Info("grpc_unary_call",
+			zap.String("method", info.FullMethod),
+			zap.String("code", code),
+			zap.Duration("duration", duration),
+			zap.String("peer", peerKeyFromContext(ctx)),
+			zap.Bool("success", err == nil),
+		)
 		return resp, err
 	}
 }
@@ -1222,7 +1229,13 @@ func grpcServerStreamMetricsInterceptor(m *serverMetrics) grpc.StreamServerInter
 			m.streamFailures.Add(1)
 			code = "STREAM_ERROR"
 		}
-		log.Printf("grpc_stream method=%s code=%s duration_ms=%d", info.FullMethod, code, duration.Milliseconds())
+		zap.L().Info("grpc_stream_call",
+			zap.String("method", info.FullMethod),
+			zap.String("code", code),
+			zap.Duration("duration", duration),
+			zap.String("peer", peerKeyFromContext(ss.Context())),
+			zap.Bool("success", err == nil),
+		)
 		return err
 	}
 }
@@ -1235,17 +1248,16 @@ func startMetricsReporter(ctx context.Context, m *serverMetrics, limiter *rateLi
 		if limiter != nil {
 			limiterSize = limiter.size()
 		}
-		log.Printf(
-			"metrics unary_calls=%d unary_failures=%d stream_calls=%d stream_failures=%d auth_failures=%d rate_limited=%d rate_limiter_entries=%d active_watchers=%d session_invalidations=%d",
-			m.unaryCalls.Load(),
-			m.unaryFailures.Load(),
-			m.streamCalls.Load(),
-			m.streamFailures.Load(),
-			m.authFailures.Load(),
-			m.rateLimited.Load(),
-			limiterSize,
-			m.activeWatchers.Load(),
-			m.sessionInvalidation.Load(),
+		zap.L().Info("server_metrics",
+			zap.Int64("unary_calls", m.unaryCalls.Load()),
+			zap.Int64("unary_failures", m.unaryFailures.Load()),
+			zap.Int64("stream_calls", m.streamCalls.Load()),
+			zap.Int64("stream_failures", m.streamFailures.Load()),
+			zap.Int64("auth_failures", m.authFailures.Load()),
+			zap.Int64("rate_limited", m.rateLimited.Load()),
+			zap.Int("rate_limiter_entries", limiterSize),
+			zap.Int64("active_watchers", m.activeWatchers.Load()),
+			zap.Int64("session_invalidations", m.sessionInvalidation.Load()),
 		)
 	}
 	for {
@@ -1270,6 +1282,17 @@ func newServerID() string {
 
 // main 启动 gRPC 锁服务。
 func main() {
+	// Initialize logger
+	logConfig := logger.LoadConfigFromEnv()
+	zapLogger, err := logger.NewLogger(logConfig)
+	if err != nil {
+		panic(fmt.Sprintf("initialize logger: %v", err))
+	}
+	defer zapLogger.Sync()
+
+	// Replace global logger
+	zap.ReplaceGlobals(zapLogger)
+
 	addr := envOrDefault("LOCK_SERVER_ADDR", ":8080")
 	shardCount := envAsInt("LOCK_SERVER_SHARDS", 1024)
 	defaultLeaseMS := envAsInt("LOCK_SERVER_DEFAULT_LEASE_MS", 8000)
@@ -1282,7 +1305,7 @@ func main() {
 
 	locker, err := hierlock.New(shardCount)
 	if err != nil {
-		log.Fatalf("create locker: %v", err)
+		zap.L().Fatal("failed to create locker", zap.Error(err))
 	}
 
 	serverID := newServerID()
@@ -1308,7 +1331,7 @@ func main() {
 
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatalf("listen: %v", err)
+		zap.L().Fatal("failed to listen", zap.Error(err), zap.String("address", addr))
 	}
 	defer lis.Close()
 
@@ -1317,7 +1340,16 @@ func main() {
 		serveErr <- grpcServer.Serve(lis)
 	}()
 
-	log.Printf("lock grpc server listening on %s server_id=%s protocol=%s auth_enabled=%t rate_rps=%d rate_burst=%d idempotency_entries=%d idempotency_ttl_ms=%d", addr, serverID, protocolVersion, authToken != "", rateLimitRPS, rateLimitBurst, idempotencyEntries, idempotencyTTLMS)
+	zap.L().Info("lock grpc server started",
+		zap.String("address", addr),
+		zap.String("server_id", serverID),
+		zap.String("protocol", protocolVersion),
+		zap.Bool("auth_enabled", authToken != ""),
+		zap.Int("rate_rps", rateLimitRPS),
+		zap.Int("rate_burst", rateLimitBurst),
+		zap.Int("idempotency_entries", idempotencyEntries),
+		zap.Int("idempotency_ttl_ms", idempotencyTTLMS),
+	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -1325,13 +1357,13 @@ func main() {
 
 	select {
 	case <-ctx.Done():
-		log.Printf("shutdown signal received; draining sessions")
+		zap.L().Info("shutdown signal received; draining sessions")
 		svc.drainForRestart()
 		time.Sleep(200 * time.Millisecond)
 		grpcServer.GracefulStop()
 	case err := <-serveErr:
 		if err != nil {
-			log.Fatal(err)
+			zap.L().Fatal("server error", zap.Error(err))
 		}
 	}
 }
