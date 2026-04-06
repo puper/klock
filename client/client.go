@@ -424,16 +424,22 @@ func (c *Client) lockWithScope(ctx context.Context, scope Scope, p1, p2 string, 
 		})
 		attemptCancel()
 		if err == nil {
-			c.observeServer(resp.ServerID)
 			h := c.newHandle(resp, opt)
 			releaseReqID := c.nextRequestID("rel")
 			c.mu.Lock()
 			if c.closed {
 				c.mu.Unlock()
-				releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
-				_ = c.unlockHandleWithRequestID(releaseCtx, h, releaseReqID)
-				releaseCancel()
+				c.bestEffortReleaseHandle(h, releaseReqID)
 				return nil, errors.New("client is closed")
+			}
+			if c.sessionID == "" || c.sessionID != sessionID || resp.SessionID != sessionID {
+				c.mu.Unlock()
+				c.bestEffortReleaseHandle(h, releaseReqID)
+				if err := sleepWithContext(waitCtx, defaultAcquireRetryDelay); err != nil {
+					c.failClosedOnUncertainLockFailure(sessionID, err)
+					return nil, err
+				}
+				continue
 			}
 			c.handles[h.Token] = h
 			c.mu.Unlock()
@@ -563,6 +569,12 @@ func (c *Client) newHandle(resp lockResponse, opt LockOption) *LockHandle {
 func (c *Client) unlockHandle(ctx context.Context, h *LockHandle) error {
 	releaseReqID := c.nextRequestID("rel")
 	return c.unlockHandleWithRequestID(ctx, h, releaseReqID)
+}
+
+func (c *Client) bestEffortReleaseHandle(h *LockHandle, releaseReqID string) {
+	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_ = c.unlockHandleWithRequestID(releaseCtx, h, releaseReqID)
+	releaseCancel()
 }
 
 func (c *Client) unlockHandleWithRequestID(ctx context.Context, h *LockHandle, releaseReqID string) error {

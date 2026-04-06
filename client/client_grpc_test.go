@@ -45,6 +45,7 @@ type fakeLockRPCServer struct {
 	createSessionDelay         time.Duration
 	closeSessionDelay          time.Duration
 	watchBreakAfterEstablished bool
+	acquireServerID            string
 }
 
 func (f *fakeLockRPCServer) requireAuth(ctx context.Context) error {
@@ -130,6 +131,7 @@ func (f *fakeLockRPCServer) Acquire(ctx context.Context, req *lockrpcpb.LockRequ
 	failCode := f.failAcquireCode
 	failAPIErrorP2 := f.failAcquireAPIErrorP2
 	failAPIError := f.failAcquireAPIError
+	acquireServerID := f.acquireServerID
 	f.acquireTimeoutMS = append(f.acquireTimeoutMS, req.TimeoutMs)
 	if dl, ok := ctx.Deadline(); ok {
 		f.acquireDeadlines = append(f.acquireDeadlines, time.Until(dl))
@@ -164,11 +166,14 @@ func (f *fakeLockRPCServer) Acquire(ctx context.Context, req *lockrpcpb.LockRequ
 			Error: failAPIError,
 		}, nil
 	}
+	if acquireServerID == "" {
+		acquireServerID = "srv-a"
+	}
 	return &lockrpcpb.LockResponse{
 		Token:           "lk-1",
 		Fence:           1,
 		SessionId:       "sess-1",
-		ServerId:        "srv-a",
+		ServerId:        acquireServerID,
 		ProtocolVersion: protocolVersion,
 	}, nil
 }
@@ -497,7 +502,7 @@ func TestLockIdempotencyConflictDoesNotFailCloseSession(t *testing.T) {
 
 	grpcSrv := grpc.NewServer()
 	fake := &fakeLockRPCServer{
-		authToken:            "test-token",
+		authToken:             "test-token",
 		failAcquireAPIErrorP2: "res-idempotency-conflict",
 		failAcquireAPIError: &lockrpcpb.ErrorStatus{
 			Status:          409,
@@ -902,5 +907,156 @@ func TestCloseDuringInFlightAcquireReleasesLateHandle(t *testing.T) {
 	}
 	if len(fake.releaseTokens) != 1 || fake.releaseTokens[0] != "lk-1" {
 		t.Fatalf("unexpected release token cleanup payload: %+v", fake.releaseTokens)
+	}
+}
+
+func TestLockRejectsHandleWhenSessionInvalidatedBeforeRegistration(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer lis.Close()
+
+	grpcSrv := grpc.NewServer()
+	fake := &fakeLockRPCServer{
+		authToken:       "test-token",
+		acquireServerID: "srv-b",
+	}
+	lockrpcpb.RegisterLockServiceServer(grpcSrv, fake)
+	go grpcSrv.Serve(lis)
+	defer grpcSrv.Stop()
+
+	c := NewWithConfig("grpc://"+lis.Addr().String(), Config{
+		SessionLease:      2 * time.Second,
+		HeartbeatInterval: 200 * time.Millisecond,
+		HeartbeatTimeout:  500 * time.Millisecond,
+		LocalTTL:          2 * time.Second,
+		AuthToken:         "test-token",
+	})
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = c.Close(closeCtx)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	h, err := c.Lock(ctx, "tenant-1", "res-server-switch", LockOption{})
+	if err == nil {
+		t.Fatalf("expected lock failure under repeated session invalidation, got handle: %+v", h)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+
+	c.mu.Lock()
+	handles := len(c.handles)
+	c.mu.Unlock()
+	if handles != 0 {
+		t.Fatalf("expected no registered handles after invalidation race, got %d", handles)
+	}
+
+	fake.mu.Lock()
+	releaseCalls := fake.releaseCalls
+	fake.mu.Unlock()
+	if releaseCalls == 0 {
+		t.Fatal("expected best-effort release to run when registration is rejected")
+	}
+}
+
+func TestConcurrentObserveServerDuringAcquireDoesNotCreateOrphanHandle(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer lis.Close()
+
+	grpcSrv := grpc.NewServer()
+	fake := &fakeLockRPCServer{
+		authToken:      "test-token",
+		acquireStarted: make(chan struct{}),
+		acquireBlock:   make(chan struct{}),
+	}
+	lockrpcpb.RegisterLockServiceServer(grpcSrv, fake)
+	go grpcSrv.Serve(lis)
+	defer grpcSrv.Stop()
+
+	c := NewWithConfig("grpc://"+lis.Addr().String(), Config{
+		SessionLease:      2 * time.Second,
+		HeartbeatInterval: 200 * time.Millisecond,
+		HeartbeatTimeout:  500 * time.Millisecond,
+		LocalTTL:          2 * time.Second,
+		AuthToken:         "test-token",
+	})
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = c.Close(closeCtx)
+	}()
+
+	if _, err := c.ensureSession(context.Background()); err != nil {
+		t.Fatalf("ensure session failed: %v", err)
+	}
+
+	lockErr := make(chan error, 1)
+	lockHandle := make(chan *LockHandle, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+		defer cancel()
+		h, err := c.Lock(ctx, "tenant-1", "res-concurrent-server-switch", LockOption{})
+		lockHandle <- h
+		lockErr <- err
+	}()
+
+	select {
+	case <-fake.acquireStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for acquire to start")
+	}
+
+	c.observeServer("srv-b")
+	close(fake.acquireBlock)
+
+	h := <-lockHandle
+	err = <-lockErr
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected success or deadline exceeded after concurrent invalidation, got %v", err)
+	}
+
+	if err == nil {
+		if h == nil {
+			t.Fatal("expected non-nil handle on successful lock")
+		}
+		c.mu.Lock()
+		currentSessionID := c.sessionID
+		c.mu.Unlock()
+		if currentSessionID == "" || h.sessionID != currentSessionID {
+			t.Fatalf("expected handle bound to current session, handle session=%q current=%q", h.sessionID, currentSessionID)
+		}
+		if unlockErr := h.Unlock(context.Background()); unlockErr != nil {
+			t.Fatalf("unlock successful handle failed: %v", unlockErr)
+		}
+		<-h.Done()
+	}
+
+	c.mu.Lock()
+	currentSessionID := c.sessionID
+	for token, handle := range c.handles {
+		if handle.sessionID != currentSessionID {
+			c.mu.Unlock()
+			t.Fatalf("found orphan handle token=%s handleSession=%q currentSession=%q", token, handle.sessionID, currentSessionID)
+		}
+	}
+	handles := len(c.handles)
+	c.mu.Unlock()
+	if err != nil && handles != 0 {
+		t.Fatalf("expected no registered handles after failed lock attempt, got %d", handles)
+	}
+
+	fake.mu.Lock()
+	releaseCalls := fake.releaseCalls
+	fake.mu.Unlock()
+	if releaseCalls == 0 {
+		t.Fatal("expected release cleanup after rejecting stale handle")
 	}
 }
