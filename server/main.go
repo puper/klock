@@ -42,7 +42,7 @@ const (
 	protocolVersion      = "1"
 	errorCodeSessionGone = "SESSION_GONE"
 
-	maxIdempotencyEntries = 4096
+	maxIdempotencyEntries = 65536
 	defaultIdempotencyTTL = time.Hour
 	expiredRetention      = 10 * time.Minute
 	maxExpiredSessions    = 10000
