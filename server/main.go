@@ -179,6 +179,7 @@ type serverMetrics struct {
 	streamFailures      atomic.Int64
 	activeWatchers      atomic.Int64
 	sessionInvalidation atomic.Int64
+	watcherEventDrops   atomic.Int64
 	authFailures        atomic.Int64
 	rateLimited         atomic.Int64
 }
@@ -525,18 +526,27 @@ func (s *lockService) release(sessionID, token, requestID string) (bool, error) 
 
 // expireSession 使 session 失效并回收该 session 下的全部锁。
 func (s *lockService) expireSession(sessionID, reason string) bool {
+	s.mu.Lock()
+	handles, watcherChans, ok := s.collectSessionExpiryLocked(sessionID, reason, time.Now())
+	s.mu.Unlock()
+	if !ok {
+		return false
+	}
+	s.finalizeSessionExpiry(sessionID, reason, handles, watcherChans)
+	return true
+}
+
+func (s *lockService) collectSessionExpiryLocked(sessionID, reason string, now time.Time) ([]*lockHandle, []chan *lockrpcpb.ServerEvent, bool) {
 	var handles []*lockHandle
 	var watcherChans []chan *lockrpcpb.ServerEvent
 
-	s.mu.Lock()
 	st, ok := s.sessions[sessionID]
 	if !ok {
-		s.mu.Unlock()
-		return false
+		return nil, nil, false
 	}
 	delete(s.sessions, sessionID)
-	s.expiredSessions[sessionID] = expiredInfo{reason: reason, at: time.Now()}
-	s.pruneExpiredLocked(time.Now())
+	s.expiredSessions[sessionID] = expiredInfo{reason: reason, at: now}
+	s.pruneExpiredLocked(now)
 	if st.timer != nil {
 		st.timer.Stop()
 	}
@@ -555,8 +565,10 @@ func (s *lockService) expireSession(sessionID, reason string) bool {
 			s.metrics.activeWatchers.Add(-1)
 		}
 	}
-	s.mu.Unlock()
+	return handles, watcherChans, true
+}
 
+func (s *lockService) finalizeSessionExpiry(sessionID, reason string, handles []*lockHandle, watcherChans []chan *lockrpcpb.ServerEvent) {
 	for _, h := range handles {
 		h.safeUnlock()
 	}
@@ -575,10 +587,17 @@ func (s *lockService) expireSession(sessionID, reason string) bool {
 		select {
 		case ch <- &ev:
 		default:
+			if s.metrics != nil {
+				s.metrics.watcherEventDrops.Add(1)
+			}
+			zap.L().Warn("watcher event dropped due to full channel",
+				zap.String("session_id", sessionID),
+				zap.String("event_type", ev.Type),
+				zap.String("reason", reason),
+			)
 		}
 		close(ch)
 	}
-	return true
 }
 
 // expiredReasonLocked 查询会话是否在“最近过期记录”中。
@@ -644,14 +663,19 @@ func (s *lockService) onSessionTimer(sessionID string, seq uint64) {
 		s.mu.Unlock()
 		return
 	}
+	now := time.Now()
 	// If expiresAt moved forward due to heartbeat, re-arm and do not expire now.
-	if time.Now().Before(st.expiresAt) {
+	if now.Before(st.expiresAt) {
 		s.armSessionTimerLocked(st)
 		s.mu.Unlock()
 		return
 	}
+	handles, watcherChans, ok := s.collectSessionExpiryLocked(sessionID, "lease_expired", now)
 	s.mu.Unlock()
-	s.expireSession(sessionID, "lease_expired")
+	if !ok {
+		return
+	}
+	s.finalizeSessionExpiry(sessionID, "lease_expired", handles, watcherChans)
 }
 
 func (s *lockService) registerWatcher(sessionID string) (<-chan *lockrpcpb.ServerEvent, uint64, error) {
@@ -1258,6 +1282,7 @@ func startMetricsReporter(ctx context.Context, m *serverMetrics, limiter *rateLi
 			zap.Int("rate_limiter_entries", limiterSize),
 			zap.Int64("active_watchers", m.activeWatchers.Load()),
 			zap.Int64("session_invalidations", m.sessionInvalidation.Load()),
+			zap.Int64("watcher_event_drops", m.watcherEventDrops.Load()),
 		)
 	}
 	for {

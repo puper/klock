@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/puper/klock/pkg/hierlock"
+	"github.com/puper/klock/pkg/lockrpcpb"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 )
@@ -499,6 +500,34 @@ func TestDrainForRestartNotifiesWatchers(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for restart invalidation event")
+	}
+}
+
+func TestExpireSessionRecordsWatcherEventDropWhenChannelFull(t *testing.T) {
+	svc := newLockService(hierlock.MustNew(16), time.Second, 5*time.Second, "srv-test")
+	sess, err := svc.createSession(createSessionRequest{})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	_, watcherID, err := svc.registerWatcher(sess.SessionID)
+	if err != nil {
+		t.Fatalf("register watcher: %v", err)
+	}
+
+	svc.mu.Lock()
+	st := svc.sessions[sess.SessionID]
+	ch := st.watchers[watcherID]
+	for i := 0; i < cap(ch); i++ {
+		ch <- &lockrpcpb.ServerEvent{Type: "FILL"}
+	}
+	svc.mu.Unlock()
+
+	if !svc.expireSession(sess.SessionID, "test_drop") {
+		t.Fatal("expected session to expire")
+	}
+	if got := svc.metrics.watcherEventDrops.Load(); got != 1 {
+		t.Fatalf("expected watcher event drop metric to be 1, got %d", got)
 	}
 }
 
