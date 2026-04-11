@@ -16,7 +16,7 @@
 2. 父子双向互斥：`L1` 与该前缀下任意 `L2` 不可并存（持有 `L1` 时阻塞新 `L2`，存在任意 `L2` 时 `L1` 需等待）
 3. 分片存储：降低 map 竞争
 4. 引用计数回收：动态创建锁节点并回收
-5. `context` 超时：避免逻辑死锁
+5. 可取消阻塞等待：`hierlock` 内部采用队列化 `park/unpark` 等待（避免忙等自旋）
 6. 会话租约（session lease）+ 全局 heartbeat（不是每把锁一个心跳）
 7. fencing token（单调递增）
 8. request id 幂等（acquire/release）
@@ -195,6 +195,22 @@ func main() {
 go test ./...
 go test -race ./...
 ```
+
+`hierlock` 对比基准（当前阻塞实现 vs 基准内置旧自旋实现）：
+
+```bash
+go test ./pkg/hierlock \
+  -bench 'BenchmarkLocker_(L2HotKey|L2Keyspace1024|MixedL1WriterL2Readers)' \
+  -benchmem \
+  -run '^$' \
+  -benchtime=2s \
+  -count=3
+```
+
+说明：
+
+1. `spin` 对照实现仅用于 benchmark，定义在 `pkg/hierlock/benchmark_test.go`，不参与生产路径。
+2. 实际性能受 CPU、GOMAXPROCS、并发度与 key 分布影响，应以目标环境复测为准。
 
 压测（示例）：
 

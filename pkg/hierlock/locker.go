@@ -3,20 +3,14 @@ package hierlock
 import (
 	"context"
 	"errors"
-	"runtime"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 const (
 	// defaultShardCount 是默认分片数。分片越多，热点 key 在 map 层面的锁竞争通常越小，
 	// 但会增加一些内存占用。
 	defaultShardCount = 1024
-	// activeSpins 表示进入 sleep 退避前，最多主动让出 CPU 的次数。
-	activeSpins = 32
-	// maxBackoff 是自旋失败后的最大退避时长。
-	maxBackoff = time.Millisecond
 )
 
 // errInvalidShardCount 表示分片数非法。
@@ -31,16 +25,31 @@ type key2 struct {
 // lockNode 是实际的锁节点。
 //
 // 设计说明：
-//  1. mu 为节点锁本体。L1 节点使用 RWMutex：写锁代表 L1 独占，读锁代表 L2 进入门票。
+//  1. stateMu 保护节点内部可重入状态；通过等待队列实现 park/unpark。
 //  2. refCount 用于生命周期管理；当引用归零后从 shard map 中回收节点。
-//  3. pendingWriters 用于“写者优先门控”：
-//     当 L1 写者在等待时，阻止新的 L1 读者（即新的 L2 请求）继续进入，
-//     以降低写者饥饿概率。
+//  3. waitQ 按到达顺序排队；唤醒策略为“写优先 + 连续读者批量放行”。
 type lockNode struct {
-	mu       sync.RWMutex
+	stateMu sync.Mutex
+
+	readers int
+	writer  bool
+	waitQ   []*nodeWaiter
+
 	refCount int32
-	// pendingWriters gates new readers when level-1 writers are waiting.
-	pendingWriters int32
+}
+
+type waiterKind uint8
+
+const (
+	waiterReader waiterKind = iota + 1
+	waiterWriter
+)
+
+type nodeWaiter struct {
+	kind waiterKind
+	ch   chan struct{}
+
+	granted bool
 }
 
 // lockShard 是分片容器，承载一组 L1/L2 节点 map。
@@ -107,10 +116,7 @@ func (h *HierarchicalLocker) LockL1(ctx context.Context, p1 string) (func(), err
 
 	s := h.shardFor(p1)
 	l1 := s.retainL1(p1)
-	atomic.AddInt32(&l1.pendingWriters, 1)
-
-	if err := spinUntilLocked(ctx, l1.mu.TryLock); err != nil {
-		atomic.AddInt32(&l1.pendingWriters, -1)
+	if err := l1.lockWriter(ctx); err != nil {
 		s.releaseL1(p1, l1)
 		return nil, err
 	}
@@ -118,8 +124,7 @@ func (h *HierarchicalLocker) LockL1(ctx context.Context, p1 string) (func(), err
 	var once sync.Once
 	unlock := func() {
 		once.Do(func() {
-			l1.mu.Unlock()
-			atomic.AddInt32(&l1.pendingWriters, -1)
+			l1.unlockWriter()
 			s.releaseL1(p1, l1)
 		})
 	}
@@ -143,18 +148,16 @@ func (h *HierarchicalLocker) Lock(ctx context.Context, p1, p2 string) (func(), e
 
 	s := h.shardFor(p1)
 	l1 := s.retainL1(p1)
-	if err := spinUntilLockedWithGate(ctx, func() bool {
-		return atomic.LoadInt32(&l1.pendingWriters) == 0
-	}, l1.mu.TryRLock); err != nil {
+	if err := l1.lockReader(ctx); err != nil {
 		s.releaseL1(p1, l1)
 		return nil, err
 	}
 
 	k := key2{p1: p1, p2: p2}
 	l2 := s.retainL2(k)
-	if err := spinUntilLocked(ctx, l2.mu.TryLock); err != nil {
+	if err := l2.lockWriter(ctx); err != nil {
 		s.releaseL2(k, l2)
-		l1.mu.RUnlock()
+		l1.unlockReader()
 		s.releaseL1(p1, l1)
 		return nil, err
 	}
@@ -162,10 +165,10 @@ func (h *HierarchicalLocker) Lock(ctx context.Context, p1, p2 string) (func(), e
 	var once sync.Once
 	unlock := func() {
 		once.Do(func() {
-			l2.mu.Unlock()
+			l2.unlockWriter()
 			s.releaseL2(k, l2)
 
-			l1.mu.RUnlock()
+			l1.unlockReader()
 			s.releaseL1(p1, l1)
 		})
 	}
@@ -233,85 +236,123 @@ func (s *lockShard) releaseL2(k key2, n *lockNode) {
 	}
 }
 
-// spinUntilLocked 在 ctx 约束下循环尝试加锁，直到成功或超时/取消。
-func spinUntilLocked(ctx context.Context, tryLock func() bool) error {
-	return spinUntilLockedWithGate(ctx, nil, tryLock)
-}
-
-// spinUntilLockedWithGate 支持一个可选门控条件：
-// 1. canTry==false 时不会尝试锁，只做让出/退避；
-// 2. canTry==true 时再尝试 tryLock。
-//
-// 该模式用于 L1 写者等待期间阻止新的 L1 读者进入。
-func spinUntilLockedWithGate(ctx context.Context, canTry func() bool, tryLock func() bool) error {
+func (n *lockNode) lockReader(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	backoff := time.Microsecond
-	gateBlocked := false
-	for attempts := 0; ; attempts++ {
-		if canTry != nil && !canTry() {
-			gateBlocked = true
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if attempts < activeSpins {
-				runtime.Gosched()
-				continue
-			}
-			if !sleepOrDone(ctx, backoff) {
-				return ctx.Err()
-			}
-			if backoff < maxBackoff {
-				backoff *= 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
-			}
-			continue
-		}
-		if gateBlocked {
-			attempts = 0
-			backoff = time.Microsecond
-			gateBlocked = false
-		}
+	n.stateMu.Lock()
+	if err := ctx.Err(); err != nil {
+		n.stateMu.Unlock()
+		return err
+	}
+	if !n.writer && len(n.waitQ) == 0 {
+		n.readers++
+		n.stateMu.Unlock()
+		return nil
+	}
+	w := &nodeWaiter{kind: waiterReader, ch: make(chan struct{})}
+	n.waitQ = append(n.waitQ, w)
+	n.stateMu.Unlock()
 
-		if tryLock() {
+	return n.waitForGrant(ctx, w)
+}
+
+func (n *lockNode) unlockReader() {
+	n.stateMu.Lock()
+	n.readers--
+	if n.readers == 0 {
+		n.wakeWaitersLocked()
+	}
+	n.stateMu.Unlock()
+}
+
+func (n *lockNode) lockWriter(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	n.stateMu.Lock()
+	if err := ctx.Err(); err != nil {
+		n.stateMu.Unlock()
+		return err
+	}
+	if !n.writer && n.readers == 0 && len(n.waitQ) == 0 {
+		n.writer = true
+		n.stateMu.Unlock()
+		return nil
+	}
+	w := &nodeWaiter{kind: waiterWriter, ch: make(chan struct{})}
+	n.waitQ = append(n.waitQ, w)
+	n.stateMu.Unlock()
+
+	return n.waitForGrant(ctx, w)
+}
+
+func (n *lockNode) unlockWriter() {
+	n.stateMu.Lock()
+	n.writer = false
+	n.wakeWaitersLocked()
+	n.stateMu.Unlock()
+}
+
+func (n *lockNode) waitForGrant(ctx context.Context, w *nodeWaiter) error {
+	select {
+	case <-w.ch:
+		return nil
+	case <-ctx.Done():
+		n.stateMu.Lock()
+		if w.granted {
+			n.stateMu.Unlock()
 			return nil
 		}
-		if err := ctx.Err(); err != nil {
-			return err
+		if n.removeWaiterLocked(w) {
+			n.wakeWaitersLocked()
 		}
-
-		if attempts < activeSpins {
-			runtime.Gosched()
-			continue
-		}
-
-		if !sleepOrDone(ctx, backoff) {
-			return ctx.Err()
-		}
-		if backoff < maxBackoff {
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
-		}
+		n.stateMu.Unlock()
+		return ctx.Err()
 	}
 }
 
-// sleepOrDone 在 d 时间内等待，若 ctx 先结束则返回 false。
-func sleepOrDone(ctx context.Context, d time.Duration) bool {
-	t := time.NewTimer(d)
-	defer t.Stop()
-
-	select {
-	case <-ctx.Done():
-		return false
-	case <-t.C:
-		return true
+func (n *lockNode) removeWaiterLocked(target *nodeWaiter) bool {
+	for i := range n.waitQ {
+		if n.waitQ[i] == target {
+			copy(n.waitQ[i:], n.waitQ[i+1:])
+			n.waitQ[len(n.waitQ)-1] = nil
+			n.waitQ = n.waitQ[:len(n.waitQ)-1]
+			return true
+		}
 	}
+	return false
+}
+
+func (n *lockNode) wakeWaitersLocked() {
+	if n.writer || n.readers > 0 || len(n.waitQ) == 0 {
+		return
+	}
+
+	first := n.waitQ[0]
+	if first.kind == waiterWriter {
+		n.waitQ[0] = nil
+		n.waitQ = n.waitQ[1:]
+		first.granted = true
+		n.writer = true
+		close(first.ch)
+		return
+	}
+
+	idx := 0
+	for idx < len(n.waitQ) && n.waitQ[idx].kind == waiterReader {
+		r := n.waitQ[idx]
+		r.granted = true
+		n.readers++
+		close(r.ch)
+		idx++
+	}
+	for i := 0; i < idx; i++ {
+		n.waitQ[i] = nil
+	}
+	n.waitQ = n.waitQ[idx:]
 }
 
 // hashString 使用 FNV-1a 计算字符串哈希，用于分片定位。

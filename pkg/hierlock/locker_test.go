@@ -207,22 +207,45 @@ func TestPendingWriterBlocksNewReaders(t *testing.T) {
 	}
 }
 
-func TestSpinUntilLockedWithGateResetsBackoffAfterGateOpens(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+func TestCanceledWriterWaiterDoesNotBlockFollowingReader(t *testing.T) {
+	l := MustNew(16)
+	ctx := context.Background()
+
+	holdUnlock, err := l.LockL1(ctx, "tenant-1")
+	if err != nil {
+		t.Fatalf("hold lock failed: %v", err)
+	}
+	defer holdUnlock()
+
+	cancelCtx, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
 	defer cancel()
 
-	gateOpenAt := time.Now().Add(40 * time.Millisecond)
-	start := time.Now()
-	err := spinUntilLockedWithGate(ctx, func() bool {
-		return time.Now().After(gateOpenAt)
-	}, func() bool {
-		return true
-	})
-	if err != nil {
-		t.Fatalf("expected lock attempt to succeed after gate opens, got %v", err)
+	writerErr := make(chan error, 1)
+	go func() {
+		_, e := l.LockL1(cancelCtx, "tenant-1")
+		writerErr <- e
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+
+	readerDone := make(chan error, 1)
+	go func() {
+		rctx, rcancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		defer rcancel()
+		u, e := l.Lock(rctx, "tenant-1", "res-after-cancel")
+		if e == nil {
+			u()
+		}
+		readerDone <- e
+	}()
+
+	if err := <-writerErr; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected canceled writer waiter to timeout, got %v", err)
 	}
-	elapsed := time.Since(start)
-	if elapsed > 120*time.Millisecond {
-		t.Fatalf("expected gate-open recovery to avoid excessive backoff, got %s", elapsed)
+
+	holdUnlock()
+
+	if err := <-readerDone; err != nil {
+		t.Fatalf("reader should acquire after canceled writer removal, got %v", err)
 	}
 }
