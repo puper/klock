@@ -1,6 +1,7 @@
 # Project specific
 /.opencode/
 /memory-bank/
+/.artifacts/
 
 # Build artifacts
 /build/
