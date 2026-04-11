@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/heap"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -46,6 +47,7 @@ const (
 	defaultIdempotencyTTL = time.Hour
 	expiredRetention      = 10 * time.Minute
 	maxExpiredSessions    = 10000
+	maxRateLimiterEntries = 50000
 
 	authHeaderKey   = "authorization"
 	authTokenPrefix = "Bearer "
@@ -123,6 +125,35 @@ type expiredInfo struct {
 	at     time.Time
 }
 
+type expiredSessionItem struct {
+	sessionID string
+	at        time.Time
+}
+
+type expiredSessionHeap []expiredSessionItem
+
+func (h expiredSessionHeap) Len() int { return len(h) }
+
+func (h expiredSessionHeap) Less(i, j int) bool {
+	return h[i].at.Before(h[j].at)
+}
+
+func (h expiredSessionHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+}
+
+func (h *expiredSessionHeap) Push(x any) {
+	*h = append(*h, x.(expiredSessionItem))
+}
+
+func (h *expiredSessionHeap) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
+}
+
 // sessionState 是单个 session 的内存状态。
 //
 // 关键说明：
@@ -164,6 +195,7 @@ type lockService struct {
 	sessions        map[string]*sessionState
 	tokens          map[string]*lockHandle
 	expiredSessions map[string]expiredInfo
+	expiredOrder    expiredSessionHeap
 
 	maxIdempotencyEntries int
 	idempotencyTTL        time.Duration
@@ -193,6 +225,7 @@ type rateLimiter struct {
 	mu          sync.Mutex
 	limitRPS    rate.Limit
 	burst       int
+	maxEntries  int
 	entries     map[string]*rateEntry
 	lastCleanup time.Time
 }
@@ -207,6 +240,7 @@ func newRateLimiter(limitRPS, burst int) *rateLimiter {
 	return &rateLimiter{
 		limitRPS:    rate.Limit(limitRPS),
 		burst:       burst,
+		maxEntries:  maxRateLimiterEntries,
 		entries:     make(map[string]*rateEntry),
 		lastCleanup: time.Now(),
 	}
@@ -216,6 +250,9 @@ func (r *rateLimiter) allow(key string, now time.Time) bool {
 	r.mu.Lock()
 	entry, ok := r.entries[key]
 	if !ok {
+		if len(r.entries) >= r.maxEntries {
+			r.evictOldestLocked()
+		}
 		entry = &rateEntry{
 			limiter:  rate.NewLimiter(r.limitRPS, r.burst),
 			lastSeen: now,
@@ -227,24 +264,39 @@ func (r *rateLimiter) allow(key string, now time.Time) bool {
 	shouldCleanup := now.Sub(r.lastCleanup) > time.Minute
 	if shouldCleanup {
 		r.lastCleanup = now
+		r.cleanupLocked(now)
 	}
-	r.mu.Unlock()
-
 	allowed := entry.limiter.AllowN(now, 1)
-
-	if shouldCleanup {
-		r.cleanup(now)
-	}
+	r.mu.Unlock()
 	return allowed
 }
 
-func (r *rateLimiter) cleanup(now time.Time) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+func (r *rateLimiter) cleanupLocked(now time.Time) {
 	for key, entry := range r.entries {
 		if now.Sub(entry.lastSeen) > 2*time.Minute {
 			delete(r.entries, key)
 		}
+	}
+	for len(r.entries) > r.maxEntries {
+		r.evictOldestLocked()
+	}
+}
+
+func (r *rateLimiter) evictOldestLocked() {
+	var (
+		oldestKey  string
+		oldestSeen time.Time
+		found      bool
+	)
+	for key, entry := range r.entries {
+		if !found || entry.lastSeen.Before(oldestSeen) {
+			oldestKey = key
+			oldestSeen = entry.lastSeen
+			found = true
+		}
+	}
+	if found {
+		delete(r.entries, oldestKey)
 	}
 }
 
@@ -256,7 +308,7 @@ func (r *rateLimiter) size() int {
 
 // newLockService 构造服务实例。
 func newLockService(locker *hierlock.HierarchicalLocker, defaultLease, maxLease time.Duration, serverID string) *lockService {
-	return &lockService{
+	svc := &lockService{
 		locker:                locker,
 		defaultLease:          defaultLease,
 		maxLease:              maxLease,
@@ -264,10 +316,13 @@ func newLockService(locker *hierlock.HierarchicalLocker, defaultLease, maxLease 
 		sessions:              make(map[string]*sessionState),
 		tokens:                make(map[string]*lockHandle),
 		expiredSessions:       make(map[string]expiredInfo),
+		expiredOrder:          make(expiredSessionHeap, 0, maxExpiredSessions),
 		maxIdempotencyEntries: maxIdempotencyEntries,
 		idempotencyTTL:        defaultIdempotencyTTL,
 		metrics:               &serverMetrics{},
 	}
+	heap.Init(&svc.expiredOrder)
+	return svc
 }
 
 // createSession 创建会话并初始化 lease 定时器。
@@ -545,7 +600,7 @@ func (s *lockService) collectSessionExpiryLocked(sessionID, reason string, now t
 		return nil, nil, false
 	}
 	delete(s.sessions, sessionID)
-	s.expiredSessions[sessionID] = expiredInfo{reason: reason, at: now}
+	s.putExpiredSessionLocked(sessionID, reason, now)
 	s.pruneExpiredLocked(now)
 	if st.timer != nil {
 		st.timer.Stop()
@@ -566,6 +621,11 @@ func (s *lockService) collectSessionExpiryLocked(sessionID, reason string, now t
 		}
 	}
 	return handles, watcherChans, true
+}
+
+func (s *lockService) putExpiredSessionLocked(sessionID, reason string, at time.Time) {
+	s.expiredSessions[sessionID] = expiredInfo{reason: reason, at: at}
+	heap.Push(&s.expiredOrder, expiredSessionItem{sessionID: sessionID, at: at})
 }
 
 func (s *lockService) finalizeSessionExpiry(sessionID, reason string, handles []*lockHandle, watcherChans []chan *lockrpcpb.ServerEvent) {
@@ -615,16 +675,19 @@ func (s *lockService) expiredReasonLocked(sessionID string) string {
 
 // pruneExpiredLocked 清理过期历史，避免 expiredSessions 无界增长。
 func (s *lockService) pruneExpiredLocked(now time.Time) {
-	for id, info := range s.expiredSessions {
-		if now.Sub(info.at) > expiredRetention {
-			delete(s.expiredSessions, id)
+	cutoff := now.Add(-expiredRetention)
+	for s.expiredOrder.Len() > 0 {
+		item := s.expiredOrder[0]
+		info, ok := s.expiredSessions[item.sessionID]
+		if !ok || info.at.UnixNano() != item.at.UnixNano() {
+			heap.Pop(&s.expiredOrder)
+			continue
 		}
-	}
-	for len(s.expiredSessions) > maxExpiredSessions {
-		for id := range s.expiredSessions {
-			delete(s.expiredSessions, id)
+		if info.at.After(cutoff) && len(s.expiredSessions) <= maxExpiredSessions {
 			break
 		}
+		heap.Pop(&s.expiredOrder)
+		delete(s.expiredSessions, item.sessionID)
 	}
 }
 

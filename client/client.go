@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/puper/klock/pkg/lockrpcpb"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	gcodes "google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -159,6 +160,8 @@ type LockHandle struct {
 	sessionID string
 	done      chan LockEvent
 	once      sync.Once
+	unlockMu  sync.Mutex
+	unlocked  bool
 	autoRenew bool
 	localTTL  time.Duration
 	expireAt  int64 // unix nano
@@ -174,7 +177,16 @@ func (h *LockHandle) Unlock(ctx context.Context) error {
 	if h == nil || h.client == nil {
 		return errors.New("nil lock handle")
 	}
-	return h.client.unlockHandle(ctx, h)
+	h.unlockMu.Lock()
+	defer h.unlockMu.Unlock()
+	if h.unlocked {
+		return nil
+	}
+	if err := h.client.unlockHandle(ctx, h); err != nil {
+		return err
+	}
+	h.unlocked = true
+	return nil
 }
 
 // UnlockWithRetry 在解锁失败时按固定次数与间隔重试。
@@ -182,6 +194,11 @@ func (h *LockHandle) Unlock(ctx context.Context) error {
 func (h *LockHandle) UnlockWithRetry(ctx context.Context, maxAttempts int, retryDelay time.Duration) error {
 	if h == nil || h.client == nil {
 		return errors.New("nil lock handle")
+	}
+	h.unlockMu.Lock()
+	defer h.unlockMu.Unlock()
+	if h.unlocked {
+		return nil
 	}
 	if maxAttempts <= 0 {
 		maxAttempts = 3
@@ -198,6 +215,7 @@ func (h *LockHandle) UnlockWithRetry(ctx context.Context, maxAttempts int, retry
 		}
 		err := h.client.unlockHandleWithRequestID(ctx, h, releaseReqID)
 		if err == nil {
+			h.unlocked = true
 			return nil
 		}
 		lastErr = err
@@ -475,12 +493,12 @@ func (c *Client) failClosedOnUncertainLockFailure(sessionID string, cause error)
 	if sessionID == "" || isServerDeterministicAcquireFailure(cause) {
 		return
 	}
-	c.invalidateSession(sessionID)
+	affected := c.invalidateSession(sessionID)
 	msg := "lock failed with uncertain result; session invalidated"
 	if cause != nil {
 		msg += ": " + cause.Error()
 	}
-	c.broadcastSessionEvent(sessionID, LockEvent{
+	c.broadcastSessionEventToHandles(affected, LockEvent{
 		Type:       EventSessionGone,
 		Message:    msg,
 		SessionID:  sessionID,
@@ -573,7 +591,9 @@ func (c *Client) unlockHandle(ctx context.Context, h *LockHandle) error {
 
 func (c *Client) bestEffortReleaseHandle(h *LockHandle, releaseReqID string) {
 	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	_ = c.unlockHandleWithRequestID(releaseCtx, h, releaseReqID)
+	if err := c.unlockHandleWithRequestID(releaseCtx, h, releaseReqID); err != nil {
+		zap.L().Warn("best-effort release failed", zap.String("token", h.Token), zap.String("session_id", h.sessionID), zap.Error(err))
+	}
 	releaseCancel()
 }
 
@@ -689,13 +709,13 @@ func (c *Client) Close(ctx context.Context) error {
 	}
 	if err := waitChannelWithContext(ctx, bgDone); err != nil {
 		if conn != nil {
-			_ = conn.Close()
+			closeConnWithWarn(conn, "close after bgDone wait failure")
 		}
 		return err
 	}
 	if err := waitWaitGroupWithContext(ctx, &c.sessionInitWG); err != nil {
 		if conn != nil {
-			_ = conn.Close()
+			closeConnWithWarn(conn, "close after session init wait failure")
 		}
 		return err
 	}
@@ -704,7 +724,7 @@ func (c *Client) Close(ctx context.Context) error {
 		closeErr = c.closeSessionRemoteManaged(ctx, sessionID)
 	}
 	if conn != nil {
-		_ = conn.Close()
+		closeConnWithWarn(conn, "close client connection")
 	}
 	return closeErr
 }
@@ -753,7 +773,9 @@ func (c *Client) ensureSession(ctx context.Context) (string, error) {
 				}
 				c.mu.Unlock()
 				closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-				_ = c.closeSessionRemoteManaged(closeCtx, resp.SessionID)
+				if err := c.closeSessionRemoteManaged(closeCtx, resp.SessionID); err != nil {
+					zap.L().Warn("close remote session after local close failed", zap.String("session_id", resp.SessionID), zap.Error(err))
+				}
 				cancel()
 				c.sessionInitWG.Done()
 				return "", errors.New("client is closed")
@@ -793,21 +815,22 @@ func (c *Client) ensureSession(ctx context.Context) (string, error) {
 }
 
 // invalidateSession 使当前 session 失效并停止 heartbeat。
-func (c *Client) invalidateSession(sessionID string) {
+func (c *Client) invalidateSession(sessionID string) []*LockHandle {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.sessionID != sessionID {
-		return
+	if c.sessionID == sessionID {
+		if c.heartbeatStop != nil {
+			c.heartbeatStop()
+		}
+		if c.watchStop != nil {
+			c.watchStop()
+		}
+		c.sessionID = ""
+		c.heartbeatStop = nil
+		c.watchStop = nil
 	}
-	if c.heartbeatStop != nil {
-		c.heartbeatStop()
-	}
-	if c.watchStop != nil {
-		c.watchStop()
-	}
-	c.sessionID = ""
-	c.heartbeatStop = nil
-	c.watchStop = nil
+	affected := c.collectHandlesLocked(sessionID)
+	c.mu.Unlock()
+	return affected
 }
 
 // heartbeatLoop 定期续约会话。
@@ -874,7 +897,7 @@ func (c *Client) watchLoop(ctx context.Context, sessionID string) {
 			SessionId:       sessionID,
 			ProtocolVersion: protocolVersion,
 		}); err != nil {
-			_ = stream.CloseSend()
+			closeStreamSendWithWarn(stream, "close watch stream after send failure")
 			if !c.retryWatchReconnect(ctx, sessionID, err, &backoff, &disconnectedSince) {
 				return
 			}
@@ -883,7 +906,7 @@ func (c *Client) watchLoop(ctx context.Context, sessionID string) {
 		for {
 			ev, err := stream.Recv()
 			if err != nil {
-				_ = stream.CloseSend()
+				closeStreamSendWithWarn(stream, "close watch stream after recv failure")
 				if ctx.Err() != nil {
 					return
 				}
@@ -900,9 +923,9 @@ func (c *Client) watchLoop(ctx context.Context, sessionID string) {
 					c.observeServer(ev.ServerId)
 				}
 			case "SESSION_INVALIDATED":
-				_ = stream.CloseSend()
-				c.invalidateSession(sessionID)
-				c.broadcastSessionEvent(sessionID, LockEvent{
+				closeStreamSendWithWarn(stream, "close watch stream on session invalidated event")
+				affected := c.invalidateSession(sessionID)
+				c.broadcastSessionEventToHandles(affected, LockEvent{
 					Type:       EventSessionGone,
 					Message:    ev.Message,
 					SessionID:  sessionID,
@@ -911,7 +934,7 @@ func (c *Client) watchLoop(ctx context.Context, sessionID string) {
 				})
 				return
 			case "PROTOCOL_MISMATCH":
-				_ = stream.CloseSend()
+				closeStreamSendWithWarn(stream, "close watch stream on protocol mismatch event")
 				c.broadcastEvent(LockEvent{
 					Type:       EventProtocolMismatch,
 					Message:    ev.Message,
@@ -999,12 +1022,12 @@ func (c *Client) localExpiryLoop(ctx context.Context) {
 
 // failSessionOnHeartbeat 在 heartbeat 连续失败时触发本地失效。
 func (c *Client) failSessionOnHeartbeat(sessionID string, cause error) {
-	c.invalidateSession(sessionID)
+	affected := c.invalidateSession(sessionID)
 	msg := "heartbeat failed twice; lock invalidated"
 	if cause != nil {
 		msg = msg + ": " + cause.Error()
 	}
-	c.broadcastSessionEvent(sessionID, LockEvent{
+	c.broadcastSessionEventToHandles(affected, LockEvent{
 		Type:       EventSessionGone,
 		Message:    msg,
 		SessionID:  sessionID,
@@ -1015,12 +1038,12 @@ func (c *Client) failSessionOnHeartbeat(sessionID string, cause error) {
 }
 
 func (c *Client) failSessionOnWatch(sessionID string, cause error) {
-	c.invalidateSession(sessionID)
+	affected := c.invalidateSession(sessionID)
 	msg := "watch stream disconnected; lock invalidated"
 	if cause != nil {
 		msg = msg + ": " + cause.Error()
 	}
-	c.broadcastSessionEvent(sessionID, LockEvent{
+	c.broadcastSessionEventToHandles(affected, LockEvent{
 		Type:       EventSessionGone,
 		Message:    msg,
 		SessionID:  sessionID,
@@ -1192,8 +1215,8 @@ func (c *Client) handleAPIError(sessionID string, err error) {
 	}
 	switch ae.Code {
 	case "SESSION_GONE", "SESSION_NOT_FOUND":
-		c.invalidateSession(sessionID)
-		c.broadcastSessionEvent(sessionID, LockEvent{Type: EventSessionGone, Message: ae.Message, SessionID: sessionID, ErrorCode: ae.Code, OccurredAt: time.Now()})
+		affected := c.invalidateSession(sessionID)
+		c.broadcastSessionEventToHandles(affected, LockEvent{Type: EventSessionGone, Message: ae.Message, SessionID: sessionID, ErrorCode: ae.Code, OccurredAt: time.Now()})
 	case "SERVER_INSTANCE_MISMATCH":
 		c.observeServer(ae.ServerID)
 	case "PROTOCOL_MISMATCH":
@@ -1206,6 +1229,10 @@ func (c *Client) broadcastSessionEvent(sessionID string, ev LockEvent) {
 	c.mu.Lock()
 	affected := c.collectHandlesLocked(sessionID)
 	c.mu.Unlock()
+	c.broadcastSessionEventToHandles(affected, ev)
+}
+
+func (c *Client) broadcastSessionEventToHandles(affected []*LockHandle, ev LockEvent) {
 	for _, h := range affected {
 		ev.Token = h.Token
 		h.fail(ev)
@@ -1314,8 +1341,22 @@ func (c *Client) closeSessionRemoteBestEffort(sessionID string) {
 		defer c.finishManagedRemoteClose(sessionID, done)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = c.closeSessionRemote(ctx, sessionID)
+		if err := c.closeSessionRemote(ctx, sessionID); err != nil {
+			zap.L().Warn("best-effort close remote session failed", zap.String("session_id", sessionID), zap.Error(err))
+		}
 	}()
+}
+
+func closeConnWithWarn(conn *grpc.ClientConn, reason string) {
+	if err := conn.Close(); err != nil {
+		zap.L().Warn("close grpc connection failed", zap.String("reason", reason), zap.Error(err))
+	}
+}
+
+func closeStreamSendWithWarn(stream interface{ CloseSend() error }, reason string) {
+	if err := stream.CloseSend(); err != nil {
+		zap.L().Warn("close grpc stream send failed", zap.String("reason", reason), zap.Error(err))
+	}
 }
 
 func (c *Client) closeSessionRemoteManaged(ctx context.Context, sessionID string) error {

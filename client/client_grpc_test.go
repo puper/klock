@@ -440,6 +440,50 @@ func TestUnlockWithRetryUsesSameRequestIDAndEventuallySucceeds(t *testing.T) {
 	}
 }
 
+func TestUnlockIsIdempotentAfterFirstSuccess(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer lis.Close()
+
+	grpcSrv := grpc.NewServer()
+	fake := &fakeLockRPCServer{authToken: "test-token"}
+	lockrpcpb.RegisterLockServiceServer(grpcSrv, fake)
+	go grpcSrv.Serve(lis)
+	defer grpcSrv.Stop()
+
+	c := NewWithConfig("grpc://"+lis.Addr().String(), Config{
+		SessionLease:      2 * time.Second,
+		HeartbeatInterval: 200 * time.Millisecond,
+		HeartbeatTimeout:  500 * time.Millisecond,
+		LocalTTL:          2 * time.Second,
+		AuthToken:         "test-token",
+	})
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = c.Close(closeCtx)
+	}()
+
+	h, err := c.Lock(context.Background(), "tenant-1", "res-unlock-idempotent", LockOption{})
+	if err != nil {
+		t.Fatalf("lock failed: %v", err)
+	}
+	if err := h.Unlock(context.Background()); err != nil {
+		t.Fatalf("first unlock failed: %v", err)
+	}
+	if err := h.Unlock(context.Background()); err != nil {
+		t.Fatalf("second unlock should be idempotent, got: %v", err)
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.releaseCalls != 1 {
+		t.Fatalf("expected exactly one release RPC for double unlock, got %d", fake.releaseCalls)
+	}
+}
+
 func TestLockUncertainFailureTriggersFailClosedSession(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

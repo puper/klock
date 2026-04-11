@@ -606,6 +606,61 @@ func TestRateLimiterAllowAndRefill(t *testing.T) {
 	}
 }
 
+func TestRateLimiterCapsDistinctEntryCount(t *testing.T) {
+	rl := newRateLimiter(100, 100)
+	rl.maxEntries = 3
+	now := time.Now()
+
+	keys := []string{
+		"/klock.v1.LockService/Acquire|127.0.0.1:1",
+		"/klock.v1.LockService/Acquire|127.0.0.1:2",
+		"/klock.v1.LockService/Acquire|127.0.0.1:3",
+		"/klock.v1.LockService/Acquire|127.0.0.1:4",
+	}
+	for i, key := range keys {
+		if !rl.allow(key, now.Add(time.Duration(i)*time.Second)) {
+			t.Fatalf("expected key %s to be allowed", key)
+		}
+	}
+	if got := rl.size(); got != 3 {
+		t.Fatalf("expected limiter entries capped to 3, got %d", got)
+	}
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if _, ok := rl.entries[keys[0]]; ok {
+		t.Fatalf("expected oldest key %q to be evicted", keys[0])
+	}
+}
+
+func TestPruneExpiredSessionsKeepsBoundedNewestRecords(t *testing.T) {
+	svc := newLockService(hierlock.MustNew(16), time.Second, 5*time.Second, "srv-test")
+	now := time.Now()
+	total := maxExpiredSessions + 12
+
+	svc.mu.Lock()
+	for i := 0; i < total; i++ {
+		sessionID := fmt.Sprintf("sess-%d", i)
+		at := now.Add(-time.Duration(total-i) * time.Millisecond)
+		svc.putExpiredSessionLocked(sessionID, "expired", at)
+	}
+	svc.pruneExpiredLocked(now)
+	got := len(svc.expiredSessions)
+	svc.mu.Unlock()
+
+	if got != maxExpiredSessions {
+		t.Fatalf("expected bounded expired session records=%d, got %d", maxExpiredSessions, got)
+	}
+
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+	if _, ok := svc.expiredSessions["sess-0"]; ok {
+		t.Fatal("expected oldest expired session record to be pruned")
+	}
+	if _, ok := svc.expiredSessions[fmt.Sprintf("sess-%d", total-1)]; !ok {
+		t.Fatal("expected newest expired session record to be retained")
+	}
+}
+
 func TestPeerKeyFromContextUsesHostOnly(t *testing.T) {
 	ctx := peer.NewContext(context.Background(), &peer.Peer{
 		Addr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 43210},
