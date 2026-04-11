@@ -1,0 +1,25 @@
+services:
+  klock-server:
+    image: golang:1.26.2
+    container_name: klock-server
+    restart: unless-stopped
+    volumes:
+      - ./app:/app:ro
+    working_dir: /app
+    networks:
+      default:
+        ipv4_address: 172.18.0.104
+    environment:
+      - LOCK_SERVER_ADDR=:80
+      - LOCK_SERVER_SHARDS=1024
+      - LOCK_SERVER_DEFAULT_LEASE_MS=8000
+      - LOCK_SERVER_MAX_LEASE_MS=60000
+      - LOCK_SERVER_AUTH_TOKEN=your-secret-token
+      - LOCK_SERVER_RATE_LIMIT_RPS=1000
+      - LOCK_SERVER_RATE_LIMIT_BURST=2000
+    command: ["/app/klock-server"]
+
+networks:
+  default:
+    external: true
+    name: mynet

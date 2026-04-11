@@ -1388,8 +1388,8 @@ func main() {
 	idempotencyEntries := envAsInt("LOCK_SERVER_IDEMPOTENCY_ENTRIES", 65536)
 	idempotencyTTLMS := envAsInt("LOCK_SERVER_IDEMPOTENCY_TTL_MS", int(defaultIdempotencyTTL/time.Millisecond))
 	authToken := os.Getenv("LOCK_SERVER_AUTH_TOKEN")
-	rateLimitRPS := envAsInt("LOCK_SERVER_RATE_LIMIT_RPS", 200)
-	rateLimitBurst := envAsInt("LOCK_SERVER_RATE_LIMIT_BURST", 400)
+	rateLimitRPS := envAsInt("LOCK_SERVER_RATE_LIMIT_RPS", 1000)
+	rateLimitBurst := envAsInt("LOCK_SERVER_RATE_LIMIT_BURST", 2000)
 
 	locker, err := hierlock.New(shardCount)
 	if err != nil {
