@@ -52,6 +52,12 @@ type nodeWaiter struct {
 	granted bool
 }
 
+var waiterPool = sync.Pool{
+	New: func() any {
+		return &nodeWaiter{}
+	},
+}
+
 // lockShard 是分片容器，承载一组 L1/L2 节点 map。
 // 每个 shard 拥有独立互斥锁，以降低全局 map 竞争。
 type lockShard struct {
@@ -251,7 +257,7 @@ func (n *lockNode) lockReader(ctx context.Context) error {
 		n.stateMu.Unlock()
 		return nil
 	}
-	w := &nodeWaiter{kind: waiterReader, ch: make(chan struct{})}
+	w := getNodeWaiter(waiterReader)
 	n.waitQ = append(n.waitQ, w)
 	n.stateMu.Unlock()
 
@@ -282,7 +288,7 @@ func (n *lockNode) lockWriter(ctx context.Context) error {
 		n.stateMu.Unlock()
 		return nil
 	}
-	w := &nodeWaiter{kind: waiterWriter, ch: make(chan struct{})}
+	w := getNodeWaiter(waiterWriter)
 	n.waitQ = append(n.waitQ, w)
 	n.stateMu.Unlock()
 
@@ -297,6 +303,8 @@ func (n *lockNode) unlockWriter() {
 }
 
 func (n *lockNode) waitForGrant(ctx context.Context, w *nodeWaiter) error {
+	defer putNodeWaiter(w)
+
 	select {
 	case <-w.ch:
 		return nil
@@ -306,7 +314,8 @@ func (n *lockNode) waitForGrant(ctx context.Context, w *nodeWaiter) error {
 			n.stateMu.Unlock()
 			return nil
 		}
-		if n.removeWaiterLocked(w) {
+		removed, removedHead := n.removeWaiterLocked(w)
+		if removed && removedHead {
 			n.wakeWaitersLocked()
 		}
 		n.stateMu.Unlock()
@@ -314,16 +323,17 @@ func (n *lockNode) waitForGrant(ctx context.Context, w *nodeWaiter) error {
 	}
 }
 
-func (n *lockNode) removeWaiterLocked(target *nodeWaiter) bool {
+func (n *lockNode) removeWaiterLocked(target *nodeWaiter) (removed bool, removedHead bool) {
 	for i := range n.waitQ {
 		if n.waitQ[i] == target {
+			removedHead = (i == 0)
 			copy(n.waitQ[i:], n.waitQ[i+1:])
 			n.waitQ[len(n.waitQ)-1] = nil
 			n.waitQ = n.waitQ[:len(n.waitQ)-1]
-			return true
+			return true, removedHead
 		}
 	}
-	return false
+	return false, false
 }
 
 func (n *lockNode) wakeWaitersLocked() {
@@ -353,6 +363,21 @@ func (n *lockNode) wakeWaitersLocked() {
 		n.waitQ[i] = nil
 	}
 	n.waitQ = n.waitQ[idx:]
+}
+
+func getNodeWaiter(kind waiterKind) *nodeWaiter {
+	w := waiterPool.Get().(*nodeWaiter)
+	w.kind = kind
+	w.ch = make(chan struct{})
+	w.granted = false
+	return w
+}
+
+func putNodeWaiter(w *nodeWaiter) {
+	w.kind = 0
+	w.ch = nil
+	w.granted = false
+	waiterPool.Put(w)
 }
 
 // hashString 使用 FNV-1a 计算字符串哈希，用于分片定位。

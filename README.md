@@ -211,6 +211,8 @@ go test ./pkg/hierlock \
 
 1. `spin` 对照实现仅用于 benchmark，定义在 `pkg/hierlock/benchmark_test.go`，不参与生产路径。
 2. 实际性能受 CPU、GOMAXPROCS、并发度与 key 分布影响，应以目标环境复测为准。
+3. 当前阻塞实现已包含两项低风险优化：`nodeWaiter` 结构体 `sync.Pool` 复用、取消路径仅在移除队首 waiter 时尝试唤醒。
+4. `park/unpark` 语义下每次等待仍需新建 `chan struct{}`，因此分配不可能降为 0。
 
 压测（示例）：
 
