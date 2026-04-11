@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -16,6 +17,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	gcodes "google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	gstatus "google.golang.org/grpc/status"
@@ -85,6 +87,21 @@ const (
 	EventLocalExpired EventType = "local_expired"
 )
 
+// TransportSecurityMode 定义 gRPC 传输安全模式。
+type TransportSecurityMode string
+
+const (
+	// TransportSecurityAuto 按地址 scheme 自动选择：
+	// 1. grpc:// => insecure
+	// 2. grpcs:// => TLS
+	// 3. 无 scheme => 兼容历史行为（insecure）
+	TransportSecurityAuto TransportSecurityMode = "auto"
+	// TransportSecurityInsecure 强制使用 insecure（明文）。
+	TransportSecurityInsecure TransportSecurityMode = "insecure"
+	// TransportSecurityTLS 强制使用 TLS。
+	TransportSecurityTLS TransportSecurityMode = "tls"
+)
+
 // LockEvent 是锁状态变化事件。
 type LockEvent struct {
 	Type       EventType
@@ -119,6 +136,13 @@ type Config struct {
 	LocalSweepInterval time.Duration
 	// AuthToken 会通过 gRPC metadata 的 "authorization" 头以 Bearer 方式发送。
 	AuthToken string
+	// TransportSecurity 控制 gRPC 连接是否启用 TLS。
+	//
+	// 可选值：
+	// 1. "auto"（默认）：按 baseURL scheme 自动选择；
+	// 2. "insecure"：强制明文；
+	// 3. "tls"：强制 TLS。
+	TransportSecurity TransportSecurityMode
 }
 
 // Client 是锁服务 Go SDK 主体。
@@ -325,7 +349,10 @@ func NewWithConfig(baseURL string, cfg Config) *Client {
 		cfg.LocalSweepInterval = defaultSweepInterval
 	}
 
-	target := strings.TrimSpace(strings.TrimPrefix(baseURL, "grpc://"))
+	target, transportCreds, resolveErr := resolveDialTargetAndCredentials(baseURL, cfg.TransportSecurity)
+	if target == "" {
+		target = strings.TrimSpace(baseURL)
+	}
 	c := &Client{
 		baseURL:             target,
 		cfg:                 cfg,
@@ -333,10 +360,15 @@ func NewWithConfig(baseURL string, cfg Config) *Client {
 		bgDone:              make(chan struct{}),
 		remoteCloseInFlight: make(map[string]chan struct{}),
 	}
+	if resolveErr != nil {
+		c.initErr = resolveErr
+		close(c.bgDone)
+		return c
+	}
 
 	conn, err := grpc.NewClient(
 		target,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(transportCreds),
 	)
 	if err != nil {
 		c.initErr = err
@@ -355,6 +387,51 @@ func NewWithConfig(baseURL string, cfg Config) *Client {
 	c.markBGStart()
 	go c.localExpiryLoop(sweepCtx)
 	return c
+}
+
+func resolveDialTargetAndCredentials(baseURL string, mode TransportSecurityMode) (string, credentials.TransportCredentials, error) {
+	raw := strings.TrimSpace(baseURL)
+	if raw == "" {
+		return "", nil, errors.New("grpc baseURL is empty")
+	}
+
+	target := raw
+	schemeSuggestTLS := false
+	lower := strings.ToLower(raw)
+	switch {
+	case strings.HasPrefix(lower, "grpc://"):
+		target = strings.TrimSpace(raw[len("grpc://"):])
+	case strings.HasPrefix(lower, "grpcs://"):
+		target = strings.TrimSpace(raw[len("grpcs://"):])
+		schemeSuggestTLS = true
+	}
+	if target == "" {
+		return "", nil, errors.New("grpc target is empty")
+	}
+
+	normalizedMode := TransportSecurityMode(strings.ToLower(strings.TrimSpace(string(mode))))
+	if normalizedMode == "" {
+		normalizedMode = TransportSecurityAuto
+	}
+
+	useTLS := false
+	switch normalizedMode {
+	case TransportSecurityAuto:
+		useTLS = schemeSuggestTLS
+	case TransportSecurityInsecure:
+		useTLS = false
+	case TransportSecurityTLS:
+		useTLS = true
+	default:
+		return "", nil, fmt.Errorf("invalid transport security mode: %q", mode)
+	}
+
+	if useTLS {
+		return target, credentials.NewTLS(&tls.Config{
+			MinVersion: tls.VersionTLS12,
+		}), nil
+	}
+	return target, insecure.NewCredentials(), nil
 }
 
 // Lock 获取二级锁。

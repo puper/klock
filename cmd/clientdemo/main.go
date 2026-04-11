@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -12,7 +13,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", "grpc://127.0.0.1:8080", "klock grpc address")
+	addr := flag.String("addr", "grpcs://klock.xxxx.com:443", "klock grpc address")
 	token := flag.String("token", "", "auth token")
 	runBadToken := flag.Bool("run-bad-token", true, "run auth failure scenario with a wrong token")
 	flag.Parse()
@@ -46,19 +47,32 @@ func newClient(addr, token string) (*client.Client, error) {
 		ServerLeaseBuffer: 4 * time.Second,
 		AuthToken:         token,
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	h, err := c.Lock(ctx, "demo-health", "ping", client.LockOption{
-		Timeout:        800 * time.Millisecond,
-		AttemptTimeout: 300 * time.Millisecond,
-	})
-	if err != nil {
-		return nil, err
+
+	const maxAttempts = 4
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		h, err := c.Lock(ctx, "demo-health", "ping", client.LockOption{
+			Timeout:        1500 * time.Millisecond,
+			AttemptTimeout: 500 * time.Millisecond,
+		})
+		cancel()
+		if err == nil {
+			_ = h.Unlock(context.Background())
+			<-h.Done()
+			// best effort cleanup through Close
+			return c, nil
+		}
+
+		lastErr = err
+		if attempt < maxAttempts {
+			backoff := time.Duration(attempt) * 300 * time.Millisecond
+			log.Printf("health check attempt %d/%d failed: %v (retry in %s)", attempt, maxAttempts, err, backoff)
+			time.Sleep(backoff)
+		}
 	}
-	_ = h.Unlock(context.Background())
-	<-h.Done()
-	// best effort cleanup through Close
-	return c, nil
+
+	return nil, fmt.Errorf("health check failed after %d attempts: %w", maxAttempts, lastErr)
 }
 
 func closeClient(c *client.Client) {
@@ -121,9 +135,17 @@ func runContentionTimeout(c *client.Client) error {
 	log.Printf("[S2] second lock expected failure: %v", err)
 
 	if err := h1.Unlock(context.Background()); err != nil {
-		return fmt.Errorf("S2 release first holder failed: %w", err)
+		if !isSessionGone(err) {
+			return fmt.Errorf("S2 release first holder failed: %w", err)
+		}
+		log.Printf("[S2] first holder already invalidated by fail-closed path: %v", err)
 	}
-	<-h1.Done()
+	select {
+	case ev := <-h1.Done():
+		log.Printf("[S2] first holder done event type=%s code=%s msg=%s", ev.Type, ev.ErrorCode, ev.Message)
+	case <-time.After(2 * time.Second):
+		return fmt.Errorf("S2 timeout waiting first holder done event")
+	}
 	return nil
 }
 
@@ -206,4 +228,12 @@ func runAuthFailureScenario(addr, token string) error {
 	}
 	log.Printf("[S5] expected auth failure: %v", err)
 	return nil
+}
+
+func isSessionGone(err error) bool {
+	var ae *client.APIError
+	if !errors.As(err, &ae) {
+		return false
+	}
+	return ae.Code == "SESSION_GONE" || ae.Code == "SESSION_NOT_FOUND"
 }
